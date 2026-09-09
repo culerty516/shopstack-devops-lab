@@ -1,0 +1,14 @@
+[Unit]
+Description=ShopStack Pulse Heartbeat Service
+After=network.target
+
+[Service]
+Type=simple
+User=deploy
+Group=shopstack
+ExecStart=/opt/shopstack/pulse.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
