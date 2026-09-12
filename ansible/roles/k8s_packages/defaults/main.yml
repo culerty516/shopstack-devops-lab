@@ -1,0 +1,3 @@
+---
+kubernetes_repo_minor: "v1.37"
+kubernetes_package_version: "1.37.0-1.1"

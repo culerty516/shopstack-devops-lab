@@ -1,0 +1,56 @@
+---
+- name: Set hostname
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: Add Kubernetes nodes to /etc/hosts
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} ANSIBLE MANAGED SHOPSTACK K8S NODES"
+    block: |
+      {% for host in groups['control_plane'] + groups['workers'] %}
+      {{ hostvars[host]['node_ip'] }} {{ host }}
+      {% endfor %}
+
+- name: Disable active swap
+  ansible.builtin.command: swapoff -a
+  when: ansible_facts["swaptotal_mb"] | int > 0
+  changed_when: true
+
+- name: Comment out swap entries in /etc/fstab
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^(\s*[^#\n]+\s+\S+\s+swap\s+.*)$'
+    replace: '# \1'
+
+- name: Persist required kernel modules
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/k8s.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      overlay
+      br_netfilter
+
+- name: Load required kernel modules
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - overlay
+    - br_netfilter
+
+- name: Configure required Kubernetes sysctls
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_set: true
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-kubernetes.conf
+  loop:
+    - name: net.bridge.bridge-nf-call-iptables
+      value: '1'
+    - name: net.ipv4.ip_forward
+      value: '1'

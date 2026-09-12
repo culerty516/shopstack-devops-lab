@@ -1,0 +1,114 @@
+
+PLAY [Bootstrap Kubernetes control plane] **************************************
+
+TASK [Gathering Facts] *********************************************************
+ok: [k8s-cp]
+
+TASK [Write kubeadm init configuration] ****************************************
+ok: [k8s-cp]
+
+TASK [Check whether control plane is already initialized] **********************
+ok: [k8s-cp]
+
+TASK [Run kubeadm control-plane preflight] *************************************
+skipping: [k8s-cp]
+
+TASK [Initialize Kubernetes control plane] *************************************
+ok: [k8s-cp]
+
+TASK [Create ubuntu kubeconfig directory] **************************************
+ok: [k8s-cp]
+
+TASK [Copy admin kubeconfig for ubuntu] ****************************************
+ok: [k8s-cp]
+
+TASK [Download pinned Flannel manifest] ****************************************
+ok: [k8s-cp]
+
+TASK [Force Flannel to use GCP cluster interface] ******************************
+ok: [k8s-cp]
+
+TASK [Apply Flannel CNI] *******************************************************
+ok: [k8s-cp]
+
+TASK [Wait for Flannel DaemonSet rollout] **************************************
+ok: [k8s-cp]
+
+TASK [Wait for CoreDNS to become available] ************************************
+ok: [k8s-cp]
+
+PLAY [Inspect Kubernetes worker join state] ************************************
+
+TASK [Check whether worker is already joined] **********************************
+ok: [k8s-worker-2]
+ok: [k8s-worker-1]
+
+TASK [Record whether worker needs to join] *************************************
+ok: [k8s-worker-1]
+ok: [k8s-worker-2]
+
+PLAY [Generate Kubernetes worker join credentials] *****************************
+
+TASK [Create temporary kubeadm bootstrap token] ********************************
+skipping: [k8s-cp]
+
+TASK [Calculate Kubernetes CA discovery hash] **********************************
+skipping: [k8s-cp]
+
+TASK [Record bootstrap token ID] ***********************************************
+skipping: [k8s-cp]
+
+TASK [Generate kubeadm join command] *******************************************
+skipping: [k8s-cp]
+
+TASK [Wait for bootstrap token JWS signature] **********************************
+skipping: [k8s-cp]
+
+TASK [Confirm worker join credentials are ready] *******************************
+skipping: [k8s-cp]
+
+PLAY [Join Kubernetes worker nodes] ********************************************
+
+TASK [Load temporary kubeadm bootstrap credentials] ****************************
+skipping: [k8s-worker-1]
+skipping: [k8s-worker-2]
+
+TASK [Write kubeadm worker join configuration] *********************************
+skipping: [k8s-worker-1]
+skipping: [k8s-worker-2]
+
+TASK [Run kubeadm join] ********************************************************
+skipping: [k8s-worker-1]
+skipping: [k8s-worker-2]
+
+TASK [Remove temporary kubeadm join configuration] *****************************
+skipping: [k8s-worker-1]
+skipping: [k8s-worker-2]
+
+PLAY [Remove temporary Kubernetes bootstrap token] *****************************
+
+TASK [Delete temporary bootstrap token] ****************************************
+skipping: [k8s-cp]
+
+PLAY [Verify Kubernetes cluster readiness] *************************************
+
+TASK [Wait for all Kubernetes nodes to become Ready] ***************************
+ok: [k8s-cp]
+
+TASK [Get Kubernetes nodes] ****************************************************
+ok: [k8s-cp]
+
+TASK [Show Kubernetes nodes] ***************************************************
+ok: [k8s-cp] => {
+    "kubernetes_nodes.stdout_lines": [
+        "NAME           STATUS   ROLES           AGE   VERSION   INTERNAL-IP   EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION           CONTAINER-RUNTIME",
+        "k8s-cp         Ready    control-plane   47m   v1.37.0   10.10.0.10    <none>        Ubuntu 24.04.4 LTS   7.0.0-1011-gcp (amd64)   containerd://2.2.1",
+        "k8s-worker-1   Ready    <none>          27m   v1.37.0   10.10.0.11    <none>        Ubuntu 24.04.4 LTS   7.0.0-1011-gcp (amd64)   containerd://2.2.1",
+        "k8s-worker-2   Ready    <none>          27m   v1.37.0   10.10.0.12    <none>        Ubuntu 24.04.4 LTS   7.0.0-1011-gcp (amd64)   containerd://2.2.1"
+    ]
+}
+
+PLAY RECAP *********************************************************************
+k8s-cp                     : ok=14   changed=0    unreachable=0    failed=0    skipped=8    rescued=0    ignored=0
+k8s-worker-1               : ok=2    changed=0    unreachable=0    failed=0    skipped=4    rescued=0    ignored=0
+k8s-worker-2               : ok=2    changed=0    unreachable=0    failed=0    skipped=4    rescued=0    ignored=0

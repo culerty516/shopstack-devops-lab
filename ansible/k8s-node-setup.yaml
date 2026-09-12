@@ -1,0 +1,10 @@
+---
+- name: Prepare Kubernetes nodes
+  hosts: all
+  become: true
+  gather_facts: true
+
+  roles:
+    - common
+    - containerd
+    - k8s_packages

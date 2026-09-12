@@ -1,0 +1,352 @@
+---
+- name: Bootstrap Kubernetes control plane
+  hosts: control_plane
+  become: true
+  gather_facts: true
+
+  vars:
+    kubernetes_version: "v1.37.0"
+    pod_network_cidr: "10.244.0.0/16"
+    service_cidr: "10.96.0.0/12"
+    cri_socket: "unix:///run/containerd/containerd.sock"
+    flannel_version: "v0.28.9"
+    flannel_interface: "ens4"
+    flannel_manifest: "/etc/kubernetes/kube-flannel-v0.28.9.yml"
+
+  tasks:
+    - name: Write kubeadm init configuration
+      ansible.builtin.copy:
+        dest: /etc/kubernetes/kubeadm-init.yaml
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta4
+          kind: InitConfiguration
+          localAPIEndpoint:
+            advertiseAddress: "{{ node_ip }}"
+            bindPort: 6443
+          nodeRegistration:
+            name: "{{ inventory_hostname }}"
+            criSocket: "{{ cri_socket }}"
+            kubeletExtraArgs:
+              - name: node-ip
+                value: "{{ node_ip }}"
+          ---
+          apiVersion: kubeadm.k8s.io/v1beta4
+          kind: ClusterConfiguration
+          kubernetesVersion: "{{ kubernetes_version }}"
+          networking:
+            podSubnet: "{{ pod_network_cidr }}"
+            serviceSubnet: "{{ service_cidr }}"
+            dnsDomain: cluster.local
+
+    - name: Check whether control plane is already initialized
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubernetes_admin_conf
+
+    - name: Run kubeadm control-plane preflight
+      ansible.builtin.command:
+        argv:
+          - kubeadm
+          - init
+          - phase
+          - preflight
+          - --config
+          - /etc/kubernetes/kubeadm-init.yaml
+      when: not kubernetes_admin_conf.stat.exists
+      changed_when: false
+
+    - name: Initialize Kubernetes control plane
+      ansible.builtin.command:
+        argv:
+          - kubeadm
+          - init
+          - --config
+          - /etc/kubernetes/kubeadm-init.yaml
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Create ubuntu kubeconfig directory
+      ansible.builtin.file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0700'
+
+    - name: Copy admin kubeconfig for ubuntu
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        remote_src: true
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    - name: Download pinned Flannel manifest
+      ansible.builtin.get_url:
+        url: "https://github.com/flannel-io/flannel/releases/download/{{ flannel_version }}/kube-flannel.yml"
+        dest: "{{ flannel_manifest }}"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Force Flannel to use GCP cluster interface
+      ansible.builtin.lineinfile:
+        path: "{{ flannel_manifest }}"
+        insertafter: '^\s+- --kube-subnet-mgr$'
+        line: '        - --iface={{ flannel_interface }}'
+        state: present
+
+    - name: Apply Flannel CNI
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - apply
+          - -f
+          - "{{ flannel_manifest }}"
+      register: flannel_apply
+      changed_when: >-
+        ' created' in flannel_apply.stdout or
+        ' configured' in flannel_apply.stdout
+
+    - name: Wait for Flannel DaemonSet rollout
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - -n
+          - kube-flannel
+          - rollout
+          - status
+          - daemonset/kube-flannel-ds
+          - --timeout=300s
+      changed_when: false
+
+    - name: Wait for CoreDNS to become available
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - -n
+          - kube-system
+          - wait
+          - --for=condition=Available
+          - deployment/coredns
+          - --timeout=300s
+      changed_when: false
+
+- name: Inspect Kubernetes worker join state
+  hosts: workers
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Check whether worker is already joined
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: worker_kubelet_conf
+
+    - name: Record whether worker needs to join
+      ansible.builtin.set_fact:
+        worker_needs_join: "{{ not worker_kubelet_conf.stat.exists }}"
+
+- name: Generate Kubernetes worker join credentials
+  hosts: control_plane
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Create temporary kubeadm bootstrap token
+      ansible.builtin.command:
+        argv:
+          - kubeadm
+          - token
+          - create
+          - --ttl
+          - 30m
+      register: kubeadm_bootstrap_token
+      changed_when: true
+      no_log: true
+      when:
+        - hostvars['k8s-worker-1']['worker_needs_join'] or
+          hostvars['k8s-worker-2']['worker_needs_join']
+
+    - name: Calculate Kubernetes CA discovery hash
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt |
+          openssl rsa -pubin -outform der 2>/dev/null |
+          openssl dgst -sha256 -hex |
+          awk '{print $2}'
+        executable: /bin/bash
+      register: kubeadm_ca_hash
+      changed_when: false
+      no_log: true
+      when:
+        - hostvars['k8s-worker-1']['worker_needs_join'] or
+          hostvars['k8s-worker-2']['worker_needs_join']
+
+    - name: Record bootstrap token ID
+      ansible.builtin.set_fact:
+        kubeadm_bootstrap_token_id: >-
+          {{ (kubeadm_bootstrap_token.stdout | trim).split('.')[0] }}
+      no_log: true
+      when:
+        - hostvars['k8s-worker-1']['worker_needs_join'] or
+          hostvars['k8s-worker-2']['worker_needs_join']
+
+    - name: Generate kubeadm join command
+      ansible.builtin.set_fact:
+        kubeadm_join_command: >-
+          kubeadm join {{ node_ip }}:6443
+          --token {{ kubeadm_bootstrap_token.stdout | trim }}
+          --discovery-token-ca-cert-hash sha256:{{ kubeadm_ca_hash.stdout | trim }}
+      no_log: true
+      when:
+        - hostvars['k8s-worker-1']['worker_needs_join'] or
+          hostvars['k8s-worker-2']['worker_needs_join']
+
+    - name: Wait for bootstrap token JWS signature
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - -n
+          - kube-public
+          - get
+          - configmap
+          - cluster-info
+          - "-o=jsonpath={.data.jws-kubeconfig-{{ kubeadm_bootstrap_token_id }}}"
+      register: kubeadm_bootstrap_jws
+      changed_when: false
+      retries: 18
+      delay: 5
+      until: kubeadm_bootstrap_jws.stdout | trim | length > 0
+      no_log: true
+      when:
+        - hostvars['k8s-worker-1']['worker_needs_join'] or
+          hostvars['k8s-worker-2']['worker_needs_join']
+
+    - name: Confirm worker join credentials are ready
+      ansible.builtin.debug:
+        msg: "Bootstrap token JWS is available. Worker join can proceed."
+      when:
+        - hostvars['k8s-worker-1']['worker_needs_join'] or
+          hostvars['k8s-worker-2']['worker_needs_join']
+
+- name: Join Kubernetes worker nodes
+  hosts: workers
+  become: true
+  gather_facts: false
+
+  vars:
+    control_plane_host: "{{ groups['control_plane'][0] }}"
+
+  tasks:
+    - name: Load temporary kubeadm bootstrap credentials
+      ansible.builtin.set_fact:
+        kubeadm_join_token: >-
+          {{ hostvars[control_plane_host]['kubeadm_bootstrap_token']['stdout'] | trim }}
+        kubeadm_join_ca_hash: >-
+          sha256:{{ hostvars[control_plane_host]['kubeadm_ca_hash']['stdout'] | trim }}
+      no_log: true
+      when: worker_needs_join
+
+    - name: Write kubeadm worker join configuration
+      ansible.builtin.copy:
+        dest: /etc/kubernetes/kubeadm-join.yaml
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta4
+          kind: JoinConfiguration
+          discovery:
+            bootstrapToken:
+              apiServerEndpoint: "{{ hostvars[control_plane_host]['node_ip'] }}:6443"
+              token: "{{ kubeadm_join_token }}"
+              caCertHashes:
+                - "{{ kubeadm_join_ca_hash }}"
+            tlsBootstrapToken: "{{ kubeadm_join_token }}"
+          nodeRegistration:
+            name: "{{ inventory_hostname }}"
+            criSocket: "unix:///run/containerd/containerd.sock"
+            kubeletExtraArgs:
+              - name: node-ip
+                value: "{{ node_ip }}"
+      no_log: true
+      when: worker_needs_join
+
+    - name: Run kubeadm join
+      ansible.builtin.command:
+        argv:
+          - kubeadm
+          - join
+          - --config
+          - /etc/kubernetes/kubeadm-join.yaml
+        creates: /etc/kubernetes/kubelet.conf
+      when: worker_needs_join
+
+    - name: Remove temporary kubeadm join configuration
+      ansible.builtin.file:
+        path: /etc/kubernetes/kubeadm-join.yaml
+        state: absent
+      when: worker_needs_join
+
+- name: Remove temporary Kubernetes bootstrap token
+  hosts: control_plane
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Delete temporary bootstrap token
+      ansible.builtin.command:
+        argv:
+          - kubeadm
+          - token
+          - delete
+          - "{{ kubeadm_bootstrap_token_id }}"
+      changed_when: true
+      no_log: true
+      when:
+        - kubeadm_bootstrap_token_id is defined
+        - hostvars['k8s-worker-1']['worker_needs_join'] or
+          hostvars['k8s-worker-2']['worker_needs_join']
+
+- name: Verify Kubernetes cluster readiness
+  hosts: control_plane
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Wait for all Kubernetes nodes to become Ready
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - wait
+          - --for=condition=Ready
+          - node
+          - --all
+          - --timeout=300s
+      changed_when: false
+
+    - name: Get Kubernetes nodes
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig=/etc/kubernetes/admin.conf
+          - get
+          - nodes
+          - -o
+          - wide
+      register: kubernetes_nodes
+      changed_when: false
+
+    - name: Show Kubernetes nodes
+      ansible.builtin.debug:
+        var: kubernetes_nodes.stdout_lines

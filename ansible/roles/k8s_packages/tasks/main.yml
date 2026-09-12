@@ -1,0 +1,86 @@
+---
+- name: Install Kubernetes repository prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gpg
+    state: present
+    update_cache: true
+    cache_valid_time: 86400
+
+- name: Ensure APT keyring directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Download Kubernetes repository signing key
+  ansible.builtin.get_url:
+    url: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_repo_minor }}/deb/Release.key"
+    dest: /tmp/kubernetes-release.key
+    owner: root
+    group: root
+    mode: '0644'
+  register: kubernetes_release_key
+
+- name: Check Kubernetes APT keyring
+  ansible.builtin.stat:
+    path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  register: kubernetes_keyring
+
+- name: Convert Kubernetes signing key to GPG keyring
+  ansible.builtin.command:
+    argv:
+      - gpg
+      - --dearmor
+      - --yes
+      - --output
+      - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      - /tmp/kubernetes-release.key
+  when:
+    - kubernetes_release_key.changed or not kubernetes_keyring.stat.exists
+
+- name: Ensure Kubernetes APT keyring is readable
+  ansible.builtin.file:
+    path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Configure Kubernetes v1.37 APT repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/kubernetes.list
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ kubernetes_repo_minor }}/deb/ /
+  register: kubernetes_repository
+
+- name: Update APT cache after adding Kubernetes repository
+  ansible.builtin.apt:
+    update_cache: true
+  when:
+    - kubernetes_repository.changed or
+      kubernetes_release_key.changed or
+      not kubernetes_keyring.stat.exists
+
+- name: Install pinned Kubernetes packages
+  ansible.builtin.apt:
+    name:
+      - "kubelet={{ kubernetes_package_version }}"
+      - "kubeadm={{ kubernetes_package_version }}"
+      - "kubectl={{ kubernetes_package_version }}"
+    state: present
+
+- name: Hold Kubernetes packages
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl

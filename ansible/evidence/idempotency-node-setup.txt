@@ -1,0 +1,134 @@
+
+PLAY [Prepare Kubernetes nodes] ************************************************
+
+TASK [Gathering Facts] *********************************************************
+ok: [k8s-cp]
+ok: [k8s-worker-2]
+ok: [k8s-worker-1]
+
+TASK [common : Set hostname] ***************************************************
+ok: [k8s-worker-2]
+ok: [k8s-worker-1]
+ok: [k8s-cp]
+
+TASK [common : Add Kubernetes nodes to /etc/hosts] *****************************
+ok: [k8s-worker-2]
+ok: [k8s-worker-1]
+ok: [k8s-cp]
+
+TASK [common : Disable active swap] ********************************************
+skipping: [k8s-worker-1]
+skipping: [k8s-cp]
+skipping: [k8s-worker-2]
+
+TASK [common : Comment out swap entries in /etc/fstab] *************************
+ok: [k8s-worker-2]
+ok: [k8s-worker-1]
+ok: [k8s-cp]
+
+TASK [common : Persist required kernel modules] ********************************
+ok: [k8s-worker-2]
+ok: [k8s-worker-1]
+ok: [k8s-cp]
+
+TASK [common : Load required kernel modules] ***********************************
+ok: [k8s-worker-2] => (item=overlay)
+ok: [k8s-worker-1] => (item=overlay)
+ok: [k8s-cp] => (item=overlay)
+ok: [k8s-worker-2] => (item=br_netfilter)
+ok: [k8s-cp] => (item=br_netfilter)
+ok: [k8s-worker-1] => (item=br_netfilter)
+
+TASK [common : Configure required Kubernetes sysctls] **************************
+ok: [k8s-worker-2] => (item={'name': 'net.bridge.bridge-nf-call-iptables', 'value': '1'})
+ok: [k8s-cp] => (item={'name': 'net.bridge.bridge-nf-call-iptables', 'value': '1'})
+ok: [k8s-worker-1] => (item={'name': 'net.bridge.bridge-nf-call-iptables', 'value': '1'})
+ok: [k8s-worker-2] => (item={'name': 'net.ipv4.ip_forward', 'value': '1'})
+ok: [k8s-cp] => (item={'name': 'net.ipv4.ip_forward', 'value': '1'})
+ok: [k8s-worker-1] => (item={'name': 'net.ipv4.ip_forward', 'value': '1'})
+
+TASK [containerd : Install containerd] *****************************************
+ok: [k8s-worker-2]
+ok: [k8s-cp]
+ok: [k8s-worker-1]
+
+TASK [containerd : Create containerd configuration directory] ******************
+ok: [k8s-worker-2]
+ok: [k8s-worker-1]
+ok: [k8s-cp]
+
+TASK [containerd : Generate default containerd configuration] ******************
+ok: [k8s-worker-1]
+ok: [k8s-cp]
+ok: [k8s-worker-2]
+
+TASK [containerd : Enable systemd cgroup driver] *******************************
+ok: [k8s-cp]
+ok: [k8s-worker-1]
+ok: [k8s-worker-2]
+
+TASK [containerd : Enable and start containerd] ********************************
+ok: [k8s-worker-1]
+ok: [k8s-cp]
+ok: [k8s-worker-2]
+
+TASK [k8s_packages : Install Kubernetes repository prerequisites] **************
+ok: [k8s-cp]
+ok: [k8s-worker-1]
+ok: [k8s-worker-2]
+
+TASK [k8s_packages : Ensure APT keyring directory exists] **********************
+ok: [k8s-worker-2]
+ok: [k8s-worker-1]
+ok: [k8s-cp]
+
+TASK [k8s_packages : Download Kubernetes repository signing key] ***************
+ok: [k8s-worker-2]
+ok: [k8s-cp]
+ok: [k8s-worker-1]
+
+TASK [k8s_packages : Check Kubernetes APT keyring] *****************************
+ok: [k8s-worker-2]
+ok: [k8s-worker-1]
+ok: [k8s-cp]
+
+TASK [k8s_packages : Convert Kubernetes signing key to GPG keyring] ************
+skipping: [k8s-cp]
+skipping: [k8s-worker-1]
+skipping: [k8s-worker-2]
+
+TASK [k8s_packages : Ensure Kubernetes APT keyring is readable] ****************
+ok: [k8s-worker-2]
+ok: [k8s-worker-1]
+ok: [k8s-cp]
+
+TASK [k8s_packages : Configure Kubernetes v1.37 APT repository] ****************
+ok: [k8s-worker-2]
+ok: [k8s-worker-1]
+ok: [k8s-cp]
+
+TASK [k8s_packages : Update APT cache after adding Kubernetes repository] ******
+skipping: [k8s-cp]
+skipping: [k8s-worker-1]
+skipping: [k8s-worker-2]
+
+TASK [k8s_packages : Install pinned Kubernetes packages] ***********************
+ok: [k8s-worker-1]
+ok: [k8s-worker-2]
+ok: [k8s-cp]
+
+TASK [k8s_packages : Hold Kubernetes packages] *********************************
+ok: [k8s-worker-1] => (item=kubelet)
+ok: [k8s-worker-2] => (item=kubelet)
+ok: [k8s-cp] => (item=kubelet)
+ok: [k8s-worker-2] => (item=kubeadm)
+ok: [k8s-worker-1] => (item=kubeadm)
+ok: [k8s-cp] => (item=kubeadm)
+ok: [k8s-worker-2] => (item=kubectl)
+ok: [k8s-worker-1] => (item=kubectl)
+ok: [k8s-cp] => (item=kubectl)
+
+PLAY RECAP *********************************************************************
+k8s-cp                     : ok=20   changed=0    unreachable=0    failed=0    skipped=3    rescued=0    ignored=0
+k8s-worker-1               : ok=20   changed=0    unreachable=0    failed=0    skipped=3    rescued=0    ignored=0
+k8s-worker-2               : ok=20   changed=0    unreachable=0    failed=0    skipped=3    rescued=0    ignored=0

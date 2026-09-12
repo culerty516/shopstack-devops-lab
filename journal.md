@@ -2244,3 +2244,1072 @@ A subsequent `git status --short` showed only the intended Task 2 deliverables.
 ---
 
 **Task 2 status: COMPLETE**
+---
+
+# Task 3 — Ansible: Automated K8s Node Setup
+
+**Date completed:** 2026-09-13
+**Control node:** MacBook Pro
+**Managed platform:** Google Compute Engine
+**Managed OS:** Ubuntu 24.04.4 LTS, x86_64
+**Kubernetes version:** v1.37.0
+**Container runtime:** containerd 2.2.1
+
+The three Task 2 VMs were reused directly:
+
+```text
+k8s-cp        10.10.0.10
+k8s-worker-1  10.10.0.11
+k8s-worker-2  10.10.0.12
+```
+
+All node preparation and Kubernetes bootstrap configuration in this task was performed through Ansible. No interactive SSH session was used to configure the managed nodes.
+
+---
+
+# 6.1 Ansible Foundations
+
+## 6.1.1 Install Ansible and Create the Inventory
+
+At the start of Task 3, the repository was clean and the latest commit was the completed Task 2 commit:
+
+```bash
+cd ~/shopstack-devops-lab
+pwd
+git status
+git log --oneline --decorate -3
+```
+
+Key result:
+
+```text
+/Users/peipei/shopstack-devops-lab
+On branch main
+nothing to commit, working tree clean
+
+f92f3a6 (HEAD -> main) Complete Task 2 VM provisioning
+0fc7b09 Complete Task 1 Linux foundations
+```
+
+Ansible was not initially installed:
+
+```bash
+ansible --version
+```
+
+Result:
+
+```text
+zsh: command not found: ansible
+```
+
+I installed Ansible with Homebrew:
+
+```bash
+brew install ansible
+```
+
+Verification:
+
+```bash
+ansible --version
+```
+
+Key result:
+
+```text
+ansible [core 2.21.4]
+Ansible package: 14.4.0
+Python: 3.14.7
+Executable: /opt/homebrew/bin/ansible
+```
+
+I created the Ansible directory and inventory:
+
+```bash
+mkdir -p ansible
+```
+
+`ansible/inventory.ini`:
+
+```ini
+[control_plane]
+k8s-cp node_ip=10.10.0.10
+
+[workers]
+k8s-worker-1 node_ip=10.10.0.11
+k8s-worker-2 node_ip=10.10.0.12
+
+[all:vars]
+ansible_user=ubuntu
+ansible_python_interpreter=/usr/bin/python3
+```
+
+The inventory separates the control-plane and worker groups while preserving the stable internal GCP addresses for Kubernetes node configuration.
+
+## 6.1.2 Verify Ansible Connectivity
+
+From the `ansible/` directory, I tested all three nodes:
+
+```bash
+ansible all -i inventory.ini -m ping
+```
+
+Result:
+
+```text
+k8s-cp       SUCCESS -> pong
+k8s-worker-1 SUCCESS -> pong
+k8s-worker-2 SUCCESS -> pong
+```
+
+### Why Ansible is agentless
+
+Ansible uses an **agentless, push-based** model. The control node connects to managed Linux nodes over SSH and executes modules using Python available on the managed nodes. A continuously running Ansible-specific agent is not required.
+
+In this lab:
+
+```text
+MacBook Pro
+    |
+    | SSH + Python
+    v
+k8s-cp
+k8s-worker-1
+k8s-worker-2
+```
+
+A pull-based configuration model works in the opposite direction: the managed node periodically contacts a central service or repository, downloads its desired configuration, and applies it locally.
+
+In short:
+
+```text
+Push model: control system -> managed node
+Pull model: managed node -> configuration source
+```
+
+## 6.1.3 Gather Facts and Check Uptime
+
+I gathered operating-system facts from all nodes:
+
+```bash
+ansible all -i inventory.ini -m setup | grep ansible_distribution
+```
+
+All three nodes reported Ubuntu 24.04 Noble information:
+
+```text
+ansible_distribution: Ubuntu
+ansible_distribution_major_version: 24
+ansible_distribution_release: noble
+ansible_distribution_version: 24.04
+```
+
+I checked uptime on all three nodes with one command:
+
+```bash
+ansible all -i inventory.ini -m command -a uptime
+```
+
+Key result:
+
+```text
+k8s-worker-1: up 3:17
+k8s-worker-2: up 3:17
+k8s-cp:       up 3:18
+```
+
+The Ansible `command` module displayed `CHANGED` because it executed a command, but `uptime` itself did not modify the systems.
+
+I also confirmed the Ansible collections used by the playbook:
+
+```bash
+ansible-galaxy collection list | grep -E 'community\.general|ansible\.posix'
+```
+
+Result:
+
+```text
+ansible.posix       2.2.2
+community.general   13.4.0
+```
+
+---
+
+# 6.2 Node Preparation Playbook
+
+I created `ansible/k8s-node-setup.yaml` using three roles:
+
+```text
+common
+containerd
+k8s_packages
+```
+
+The final playbook structure was:
+
+```yaml
+---
+- name: Prepare Kubernetes nodes
+  hosts: all
+  become: true
+  gather_facts: true
+
+  roles:
+    - common
+    - containerd
+    - k8s_packages
+```
+
+I used syntax checks while building the playbook:
+
+```bash
+ansible-playbook -i inventory.ini k8s-node-setup.yaml --syntax-check
+```
+
+Result:
+
+```text
+playbook: k8s-node-setup.yaml
+```
+
+## 6.2.1 `common` Role
+
+I created:
+
+```text
+ansible/roles/common/tasks/main.yml
+```
+
+The role performs the following actions on all three nodes:
+
+- sets each hostname from the Ansible inventory;
+- adds all three Kubernetes nodes to `/etc/hosts`;
+- disables active swap;
+- comments swap entries out of `/etc/fstab`;
+- persists the `overlay` and `br_netfilter` kernel modules;
+- loads both modules immediately;
+- configures the required Kubernetes sysctls.
+
+The managed `/etc/hosts` block is:
+
+```text
+10.10.0.10 k8s-cp
+10.10.0.11 k8s-worker-1
+10.10.0.12 k8s-worker-2
+```
+
+Kernel modules are persisted in `/etc/modules-load.d/k8s.conf`:
+
+```text
+overlay
+br_netfilter
+```
+
+The Kubernetes sysctls are stored in `/etc/sysctl.d/99-kubernetes.conf`:
+
+```text
+net.bridge.bridge-nf-call-iptables=1
+net.ipv4.ip_forward=1
+```
+
+The first `common` role run completed successfully:
+
+```text
+k8s-cp        changed=4 failed=0
+k8s-worker-1  changed=4 failed=0
+k8s-worker-2  changed=4 failed=0
+```
+
+I verified the final state on all three nodes through Ansible. The hostnames were correct, `/etc/hosts` contained all three node mappings, `swapon --show` returned no active swap devices, and no uncommented swap entry remained in `/etc/fstab`.
+
+The required modules were loaded:
+
+```text
+br_netfilter
+overlay
+```
+
+The live sysctl values were:
+
+```text
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+```
+
+This confirmed that the `common` role prepared all three nodes for Kubernetes networking and scheduling requirements.
+
+## 6.2.2 `containerd` Role
+
+I created:
+
+```text
+ansible/roles/containerd/tasks/main.yml
+ansible/roles/containerd/handlers/main.yml
+```
+
+The role:
+
+- installs `containerd`;
+- creates `/etc/containerd`;
+- generates the default containerd configuration;
+- changes the cgroup driver to systemd;
+- enables and starts the service;
+- restarts containerd through a handler when the configuration changes.
+
+The configuration was generated from:
+
+```text
+containerd config default
+```
+
+and the required cgroup setting was changed to:
+
+```text
+SystemdCgroup = true
+```
+
+The first containerd run completed successfully:
+
+```text
+k8s-cp        changed=5 failed=0
+k8s-worker-1  changed=5 failed=0
+k8s-worker-2  changed=5 failed=0
+```
+
+Verification on all three nodes showed:
+
+```text
+containerd 2.2.1
+SystemdCgroup = true
+service: active
+service: enabled
+```
+
+## 6.2.3 `k8s_packages` Role
+
+I created:
+
+```text
+ansible/roles/k8s_packages/tasks/main.yml
+ansible/roles/k8s_packages/defaults/main.yml
+```
+
+The pinned values were:
+
+```yaml
+kubernetes_repo_minor: "v1.37"
+kubernetes_package_version: "1.37.0-1.1"
+```
+
+The role:
+
+- installs repository prerequisites;
+- downloads the Kubernetes repository signing key;
+- creates the GPG keyring;
+- configures the Kubernetes v1.37 apt repository;
+- installs exact versions of `kubelet`, `kubeadm`, and `kubectl`;
+- holds all three packages using Ansible `dpkg_selections`.
+
+The configured repository was:
+
+```text
+https://pkgs.k8s.io/core:/stable:/v1.37/deb/
+```
+
+The first package installation run completed successfully:
+
+```text
+k8s-cp        changed=6 failed=0
+k8s-worker-1  changed=6 failed=0
+k8s-worker-2  changed=6 failed=0
+```
+
+Runtime checks returned:
+
+```text
+kubeadm: v1.37.0
+kubelet: Kubernetes v1.37.0
+kubectl: Client Version v1.37.0
+```
+
+An initial attempt to display the exact Debian package versions with:
+
+```bash
+dpkg-query -W -f="${Package} ${Version}\n" kubelet kubeadm kubectl
+```
+
+inside an Ansible shell command produced blank version lines because the remote shell expanded `${Package}` and `${Version}` before `dpkg-query` interpreted them as format placeholders.
+
+I corrected the verification with:
+
+```bash
+ansible all -i inventory.ini -b -m command -a "dpkg-query -W kubelet kubeadm kubectl"
+```
+
+All three nodes returned:
+
+```text
+kubeadm  1.37.0-1.1
+kubectl  1.37.0-1.1
+kubelet  1.37.0-1.1
+```
+
+The held packages were also verified:
+
+```text
+kubeadm
+kubectl
+kubelet
+```
+
+---
+
+# 6.3 Bootstrap the Kubernetes Cluster with kubeadm
+
+## Preflight Verification
+
+Before initializing Kubernetes, I inspected the actual GCP networking and runtime state through Ansible.
+
+Observed node addressing:
+
+```text
+k8s-cp        ens4  10.10.0.10/32
+k8s-worker-1  ens4  10.10.0.11/32
+k8s-worker-2  ens4  10.10.0.12/32
+```
+
+The default gateway was `10.10.0.1`.
+
+All nodes reported:
+
+```text
+NTPSynchronized=yes
+```
+
+Before bootstrap:
+
+```text
+admin.conf=absent
+kubelet.conf=absent
+```
+
+The containerd CRI plugins reported:
+
+```text
+io.containerd.cri.v1 images   ok
+io.containerd.cri.v1 runtime  linux/amd64 ok
+```
+
+This confirmed that the nodes were synchronized, had clean kubeadm state, and had a working containerd CRI implementation.
+
+## 6.3.1 Create `k8s-cluster.yaml` and Bootstrap the Cluster
+
+I created:
+
+```text
+ansible/k8s-cluster.yaml
+```
+
+The kubeadm configuration used:
+
+```text
+Kubernetes version: v1.37.0
+API advertise address: 10.10.0.10
+Pod network CIDR: 10.244.0.0/16
+Service CIDR: 10.96.0.0/12
+CRI socket: unix:///run/containerd/containerd.sock
+```
+
+The control-plane node registration explicitly used `10.10.0.10` as the node IP.
+
+Initialization was guarded by the existence of:
+
+```text
+/etc/kubernetes/admin.conf
+```
+
+so rerunning the playbook would not initialize the cluster again.
+
+I checked the playbook syntax:
+
+```bash
+ansible-playbook -i inventory.ini k8s-cluster.yaml --syntax-check
+```
+
+Result:
+
+```text
+playbook: k8s-cluster.yaml
+```
+
+I then initialized the control plane:
+
+```bash
+ansible-playbook -i inventory.ini k8s-cluster.yaml
+```
+
+Initial recap:
+
+```text
+k8s-cp: changed=4 failed=0
+```
+
+After initialization:
+
+```text
+admin.conf=PRESENT
+```
+
+The Kubernetes API server was:
+
+```text
+https://10.10.0.10:6443
+```
+
+Before a CNI was installed, the observed transitional state was:
+
+```text
+k8s-cp   NotReady
+```
+
+and both CoreDNS pods were:
+
+```text
+0/1 Pending
+```
+
+The control-plane static components were already running:
+
+```text
+etcd
+kube-apiserver
+kube-controller-manager
+kube-scheduler
+kube-proxy
+```
+
+The node was not yet Ready because pod networking had not yet been installed.
+
+### Flannel CNI
+
+I used Flannel as the CNI plugin, pinned at:
+
+```text
+v0.28.9
+```
+
+Because the GCP nodes use `ens4` for cluster traffic, the playbook modified the Flannel DaemonSet arguments to include:
+
+```text
+--iface=ens4
+```
+
+The playbook downloaded the pinned Flannel manifest, applied it, waited for the DaemonSet rollout, and waited for CoreDNS to become available.
+
+After Flannel was installed:
+
+```text
+k8s-cp   Ready
+```
+
+The Flannel pod was:
+
+```text
+1/1 Running
+```
+
+The live Flannel arguments were verified as:
+
+```text
+["--ip-masq","--kube-subnet-mgr","--iface=ens4"]
+```
+
+Both CoreDNS pods became:
+
+```text
+1/1 Running
+```
+
+with pod-network addresses `10.244.0.2` and `10.244.0.3`.
+
+### Worker Join Automation
+
+The worker-join portion of `k8s-cluster.yaml` checks for:
+
+```text
+/etc/kubernetes/kubelet.conf
+```
+
+on each worker. If it is absent, the worker is considered not yet joined.
+
+The control plane then:
+
+1. creates a temporary kubeadm bootstrap token;
+2. calculates the Kubernetes CA discovery hash;
+3. records the bootstrap token ID;
+4. generates the join information;
+5. waits for the token's JWS signature in the `cluster-info` ConfigMap.
+
+The temporary bootstrap token used a 30-minute TTL. Sensitive token-handling tasks used `no_log` so the token was not printed in normal Ansible output.
+
+The JWS readiness check returned:
+
+```text
+Bootstrap token JWS is available. Worker join can proceed.
+```
+
+Each worker received a temporary `JoinConfiguration`, then successfully joined the cluster through `kubeadm join`.
+
+The temporary worker join configuration was removed after the join, and the temporary bootstrap token was deleted from the control plane.
+
+Final cluster verification returned:
+
+```text
+NAME           STATUS   ROLES           VERSION   INTERNAL-IP
+k8s-cp         Ready    control-plane   v1.37.0   10.10.0.10
+k8s-worker-1   Ready    <none>          v1.37.0   10.10.0.11
+k8s-worker-2   Ready    <none>          v1.37.0   10.10.0.12
+```
+
+All three nodes used `containerd://2.2.1` and reported Ubuntu 24.04.4 LTS.
+
+## 6.3.2 Local `kubectl` Access from the MacBook Pro
+
+I copied the Kubernetes admin kubeconfig from the control plane to the MacBook Pro using Ansible's `fetch` module:
+
+```bash
+mkdir -p ~/.kube
+
+ansible k8s-cp -i inventory.ini -b -m fetch \
+  -a "src=/etc/kubernetes/admin.conf dest=$HOME/.kube/shopstack-config flat=yes"
+```
+
+I restricted the file permission:
+
+```bash
+chmod 600 ~/.kube/shopstack-config
+```
+
+The original kubeconfig API endpoint was:
+
+```text
+https://10.10.0.10:6443
+```
+
+Because this is the control plane's private GCP address, I did not expose Kubernetes API port 6443 publicly. Instead, I created a local SSH tunnel:
+
+```bash
+ssh -fN \
+  -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:6443:10.10.0.10:6443 \
+  k8s-cp
+```
+
+I verified the listener:
+
+```bash
+lsof -nP -iTCP:6443 -sTCP:LISTEN
+```
+
+Key result:
+
+```text
+ssh ... TCP 127.0.0.1:6443 (LISTEN)
+```
+
+I preserved the original kubeconfig and created a tunnel-specific copy:
+
+```bash
+cp ~/.kube/shopstack-config ~/.kube/shopstack-tunnel-config
+chmod 600 ~/.kube/shopstack-tunnel-config
+```
+
+I modified only the tunnel copy:
+
+```bash
+KUBECONFIG=~/.kube/shopstack-tunnel-config \
+kubectl config set-cluster kubernetes \
+  --server=https://127.0.0.1:6443 \
+  --tls-server-name=10.10.0.10
+```
+
+Verification showed:
+
+```text
+server: https://127.0.0.1:6443
+tls-server-name: 10.10.0.10
+```
+
+This allowed the MacBook Pro to reach the private Kubernetes API through SSH while preserving TLS certificate verification.
+
+Local cluster verification:
+
+```bash
+KUBECONFIG=~/.kube/shopstack-tunnel-config kubectl cluster-info
+KUBECONFIG=~/.kube/shopstack-tunnel-config kubectl get nodes -o wide
+```
+
+Result:
+
+```text
+Kubernetes control plane is running at https://127.0.0.1:6443
+
+k8s-cp         Ready   ... 10.10.0.10
+k8s-worker-1   Ready   ... 10.10.0.11
+k8s-worker-2   Ready   ... 10.10.0.12
+```
+
+This proved that local `kubectl` on the MacBook Pro was controlling the three-node kubeadm cluster rather than minikube.
+
+## 6.3.3 Idempotency Proof
+
+I created:
+
+```text
+ansible/evidence/
+```
+
+and saved the rerun output of both playbooks.
+
+### Node-preparation playbook
+
+```bash
+ansible-playbook -i inventory.ini k8s-node-setup.yaml 2>&1 \
+  | tee evidence/idempotency-node-setup.txt
+```
+
+Final recap:
+
+```text
+k8s-cp        changed=0 failed=0
+k8s-worker-1  changed=0 failed=0
+k8s-worker-2  changed=0 failed=0
+```
+
+### Cluster playbook
+
+```bash
+ansible-playbook -i inventory.ini k8s-cluster.yaml 2>&1 \
+  | tee evidence/idempotency-cluster.txt
+```
+
+The rerun detected that the workers were already joined, so the bootstrap-token generation and worker-join tasks were skipped.
+
+Final recap:
+
+```text
+k8s-cp        changed=0 failed=0
+k8s-worker-1  changed=0 failed=0
+k8s-worker-2  changed=0 failed=0
+```
+
+### Why idempotency matters
+
+Idempotency means repeatedly applying the same configuration leaves a correctly configured system in the same desired state instead of repeatedly changing it.
+
+This is important in configuration management because automation must be safe to rerun. For example, an idempotent Kubernetes automation should not duplicate `/etc/hosts` entries, rewrite unchanged configuration, reinstall already-correct packages, recreate an existing cluster, or rejoin workers that are already members.
+
+The two `changed=0` reruns demonstrated that both Task 3 playbooks had converged on the intended state.
+
+## 6.3.4 Ansible Vault
+
+I created a demonstration variable file containing a lab-only demo value and restricted it to owner read/write access:
+
+```bash
+chmod 600 vault-demo.yml
+```
+
+I encrypted the variable file:
+
+```bash
+ansible-vault encrypt vault-demo.yml
+```
+
+Result:
+
+```text
+Encryption successful
+```
+
+The encrypted file began with:
+
+```text
+$ANSIBLE_VAULT;1.1;AES256
+```
+
+I then demonstrated decryption:
+
+```bash
+ansible-vault decrypt vault-demo.yml
+```
+
+Result:
+
+```text
+Decryption successful
+```
+
+Finally, I encrypted the file again before repository storage:
+
+```bash
+ansible-vault encrypt vault-demo.yml
+```
+
+Final verification showed the Ansible Vault header and `600` permissions. The Vault password itself was not stored in the repository.
+
+---
+
+# Checkpoint Questions
+
+## 1. Why must swap be disabled for kubelet, and why do the bridge sysctls matter for pod networking?
+
+Kubernetes needs predictable memory accounting so that kubelet can make scheduling and eviction decisions based on the memory actually available to workloads. In this lab, swap was disabled at runtime and persistently in `/etc/fstab` rather than relying on swap behaviour that was not deliberately configured for Kubernetes.
+
+The networking sysctls support pod networking:
+
+```text
+net.bridge.bridge-nf-call-iptables=1
+```
+
+allows IPv4 packets crossing a Linux bridge to pass through netfilter/iptables processing.
+
+```text
+net.ipv4.ip_forward=1
+```
+
+allows the Linux kernel to forward IPv4 traffic between interfaces and network paths.
+
+Together with `br_netfilter`, these settings support forwarding and filtering of Kubernetes pod and service traffic.
+
+## 2. What is the difference between a playbook, a role, and a task? When would you use `import_tasks` vs `include_tasks`?
+
+A **task** is an individual unit of Ansible work, such as installing one package or writing one configuration file.
+
+A **role** is a reusable structure that groups related tasks, handlers, defaults, variables, templates, and files. In this task the roles were `common`, `containerd`, and `k8s_packages`.
+
+A **playbook** defines the higher-level automation flow: which hosts are targeted, privilege settings, variables, and which roles or tasks should run.
+
+`import_tasks` is a static, parse-time import. It is suitable when the task structure is known in advance.
+
+`include_tasks` is dynamic and evaluated at runtime. It is useful when task inclusion depends on runtime variables, conditions, loops, or discovered state.
+
+In short:
+
+```text
+import_tasks  -> static / parse-time
+include_tasks -> dynamic / runtime
+```
+
+## 3. Why pin package versions and hold them instead of installing `latest`?
+
+Using `latest` can cause different nodes to receive different package versions depending on when automation runs or when repositories publish new releases.
+
+For Kubernetes, upgrades should be deliberate and coordinated. Pinning and holding the packages provides reproducible provisioning, consistent versions across nodes, protection from accidental upgrades, easier troubleshooting, and controlled upgrade planning.
+
+In this lab the packages were pinned to:
+
+```text
+kubeadm  1.37.0-1.1
+kubectl  1.37.0-1.1
+kubelet  1.37.0-1.1
+```
+
+## 4. Your kubeadm cluster has one control-plane node — what would a highly available control plane require?
+
+The current lab has one control-plane node, so the control plane is a single point of failure.
+
+A highly available design would normally use multiple control-plane nodes, commonly at least three so etcd can maintain quorum after one failure. It would also use a stable control-plane endpoint, a load balancer in front of the API servers, multiple API server instances, replicated controller-manager and scheduler processes using leader election, an HA etcd topology, and placement across separate failure domains where possible.
+
+Worker nodes would normally connect to the stable load-balanced control-plane endpoint rather than the IP address of one individual API server.
+
+---
+
+# Task 3 Summary
+
+All Task 3 practical requirements were completed successfully:
+
+- Installed Ansible on the MacBook Pro control node.
+- Created an inventory with separate `control_plane` and `workers` groups.
+- Verified agentless SSH/Python connectivity to all three GCP nodes.
+- Gathered Ubuntu facts and uptime using Ansible ad-hoc commands.
+- Built the `common`, `containerd`, and `k8s_packages` roles.
+- Configured hostnames and `/etc/hosts`.
+- Verified swap was disabled.
+- Persisted and loaded `overlay` and `br_netfilter`.
+- Configured the required Kubernetes sysctls.
+- Installed containerd 2.2.1 with `SystemdCgroup = true`.
+- Enabled and started containerd on all nodes.
+- Configured the Kubernetes v1.37 apt repository.
+- Installed `kubelet`, `kubeadm`, and `kubectl` at exact version `1.37.0-1.1`.
+- Held all three Kubernetes packages.
+- Initialized the control plane using kubeadm.
+- Installed Flannel v0.28.9 and explicitly used the GCP `ens4` interface.
+- Verified CoreDNS and Flannel health.
+- Generated temporary worker bootstrap credentials and waited for their JWS signature.
+- Joined both worker nodes through Ansible.
+- Deleted the temporary bootstrap token after the join completed.
+- Verified all three Kubernetes nodes as `Ready`.
+- Copied the admin kubeconfig to the MacBook Pro.
+- Used an SSH tunnel to access the private GCP Kubernetes API without exposing port 6443 publicly.
+- Verified local `kubectl` access from the MacBook Pro.
+- Demonstrated full idempotency with `changed=0` on both playbooks.
+- Demonstrated Ansible Vault encryption and decryption.
+- Stored the final Vault demo in encrypted form.
+
+The final Task 3 repository structure was:
+
+```text
+ansible/
+├── evidence/
+│   ├── idempotency-cluster.txt
+│   └── idempotency-node-setup.txt
+├── inventory.ini
+├── k8s-cluster.yaml
+├── k8s-node-setup.yaml
+├── roles/
+│   ├── common/
+│   │   └── tasks/
+│   │       └── main.yml
+│   ├── containerd/
+│   │   ├── handlers/
+│   │   │   └── main.yml
+│   │   └── tasks/
+│   │       └── main.yml
+│   └── k8s_packages/
+│       ├── defaults/
+│       │   └── main.yml
+│       └── tasks/
+│           └── main.yml
+└── vault-demo.yml
+```
+
+## Troubleshooting Notes
+
+### Ansible was not initially installed on the MacBook Pro
+
+**Symptom**
+
+```bash
+ansible --version
+```
+
+returned:
+
+```text
+zsh: command not found: ansible
+```
+
+**Cause**
+
+The MacBook Pro had not previously been configured as an Ansible control node.
+
+**Resolution**
+
+Installed Ansible with Homebrew:
+
+```bash
+brew install ansible
+```
+
+Verification returned:
+
+```text
+ansible [core 2.21.4]
+```
+
+### Exact package-version query initially returned blank lines
+
+**Symptom**
+
+The first package verification used:
+
+```bash
+dpkg-query -W -f="${Package} ${Version}\n" kubelet kubeadm kubectl
+```
+
+inside an Ansible shell command. The package-version section returned blank lines even though the Kubernetes binaries worked.
+
+**Cause**
+
+`${Package}` and `${Version}` were interpreted by the remote shell as shell-variable references before `dpkg-query` could interpret them as formatting placeholders. Because those shell variables were unset, they expanded to empty strings.
+
+**Resolution**
+
+Used Ansible's `command` module with the default `dpkg-query` output format:
+
+```bash
+ansible all -i inventory.ini -b -m command -a "dpkg-query -W kubelet kubeadm kubectl"
+```
+
+This returned the expected versions on all three nodes:
+
+```text
+kubeadm  1.37.0-1.1
+kubectl  1.37.0-1.1
+kubelet  1.37.0-1.1
+```
+
+### Control plane was `NotReady` before the CNI was installed
+
+**Observation**
+
+Immediately after `kubeadm init`:
+
+```text
+k8s-cp   NotReady
+```
+
+and both CoreDNS pods were `0/1 Pending` while the control-plane static pods were already running.
+
+**Cause**
+
+The cluster did not yet have a Container Network Interface plugin, so pod networking was not available.
+
+**Resolution**
+
+Installed the pinned Flannel CNI and configured it to use:
+
+```text
+--iface=ens4
+```
+
+After Flannel became ready, `k8s-cp` became `Ready` and both CoreDNS pods became `1/1 Running`.
+
+This was an expected bootstrap transition rather than a kubeadm failure.
+
+### The GCP Kubernetes API used a private address
+
+**Observation**
+
+The fetched admin kubeconfig contained:
+
+```text
+https://10.10.0.10:6443
+```
+
+The task required local `kubectl` on the MacBook Pro to control the cluster, but I did not want to expose Kubernetes API port 6443 publicly.
+
+**Resolution**
+
+Created a local SSH tunnel:
+
+```bash
+ssh -fN \
+  -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:6443:10.10.0.10:6443 \
+  k8s-cp
+```
+
+I then configured a separate tunnel-specific kubeconfig with:
+
+```text
+server: https://127.0.0.1:6443
+tls-server-name: 10.10.0.10
+```
+
+This allowed the MacBook Pro to reach the private Kubernetes API through SSH while preserving TLS certificate verification. Local `kubectl get nodes -o wide` then returned all three nodes as `Ready`.
+
+---
+
+**Task 3 status: COMPLETE**
