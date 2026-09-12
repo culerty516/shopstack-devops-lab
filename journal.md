@@ -1798,3 +1798,449 @@ This reinforced the difference between a documentation placeholder, a shell vari
 ---
 
 **Task 1 status: COMPLETE**
+
+---
+
+# Task 2 — Proxmox and VM Provisioning
+
+## 5.1 Hypervisor Orientation
+
+No Proxmox VE hardware was available. The documented Task 2 fallback permits three cloud VMs or three local VirtualBox VMs.
+
+The MacBook Pro was initially evaluated for the local VirtualBox fallback. It had approximately 8 GB RAM and approximately 25 GiB free storage. Because the Kubernetes environment requires three VMs with 4 GB RAM each, running the full environment locally would heavily overcommit the MacBook and risk resource pressure.
+
+Google Compute Engine was therefore selected for the Final Run.
+
+Provider-specific VPC, subnet, firewall, and initial source-VM settings were configured in the GCP Console. The reusable Machine Image, VM clones, snapshots, resource verification, and static-IP reservation were then performed with `gcloud` in Google Cloud Shell.
+
+VirtualBox 7.2.16 ARMv8 was inspected on the MacBook Pro.
+
+Closest fallback inspection mappings included:
+
+- `qm list` -> `VBoxManage list vms`
+- `pct list` -> no direct VirtualBox equivalent
+- `pvesm status` -> `VBoxManage list hdds`
+- `ip link` -> macOS `ifconfig`
+
+### LXC vs QEMU/KVM
+
+LXC containers share the host Linux kernel. They are lightweight, start quickly, and have low overhead, but provide less kernel isolation and cannot run their own independent guest kernel.
+
+QEMU/KVM virtual machines run their own guest kernels and virtual hardware. They use more resources but provide stronger isolation.
+
+Independent VMs are appropriate for this Kubernetes lab because each Kubernetes node should behave as an independent Linux system.
+
+## 5.2 Cloud-Init VM Template
+
+Under the cloud fallback:
+
+- the official Ubuntu 24.04 LTS GCE image replaced manual `qm disk import`;
+- GCE metadata `user-data` replaced the Proxmox cloud-init drive;
+- a GCE Machine Image replaced the Proxmox VM template;
+- independent Persistent Disks provided the equivalent of full clones.
+
+A dedicated SSH key was created:
+
+`~/.ssh/shopstack_lab_ed25519`
+
+The source VM `shopstack-template-source` used Ubuntu 24.04 LTS, x86_64, `e2-medium`, 2 vCPU, 4 GB RAM, and a 40 GB `pd-standard` disk.
+
+Cloud-init created/configured the `ubuntu` user, installed the SSH authorized key, disabled password SSH authentication, disabled direct root SSH login, and expanded the root filesystem.
+
+Verification showed:
+
+- `cloud-init status`: `done`
+- user: `ubuntu`
+- internal IP: `10.10.0.2`
+- disk: 40 GB
+- root partition: approximately 39 GB
+- root filesystem: approximately 38 GB ext4
+
+Passwordless SSH succeeded from the MacBook Pro.
+
+Before imaging, the source VM was cleaned using:
+
+`sudo cloud-init clean --logs --machine-id`
+
+The source VM was powered off.
+
+A reusable Machine Image was created:
+
+`shopstack-ubuntu2404-template`
+
+Status: `READY`
+
+Three VMs were created from the reusable image:
+
+- `k8s-cp` — 10.10.0.10
+- `k8s-worker-1` — 10.10.0.11
+- `k8s-worker-2` — 10.10.0.12
+
+All three use `e2-medium`, with 2 vCPU and 4 GB RAM.
+
+Each node has its own independent 40 GB `pd-standard` disk.
+
+A full clone has an independent disk and can operate independently of the original source template.
+
+A linked clone stores changes relative to a shared parent/base image. It requires less storage, but it depends on that base image.
+
+All three Kubernetes VMs were verified through passwordless SSH.
+
+For each node:
+
+- `cloud-init status` returned `done`;
+- the `ubuntu` user was present;
+- `hostnamectl` was checked;
+- `ip -4 -br a` showed the expected internal IP;
+- `lsblk` showed a 40 GB disk;
+- `df -hT /` showed approximately 38 GB ext4 root filesystem.
+
+Snapshots were created:
+
+- `k8s-cp-pre-task3`
+- `k8s-worker-1-pre-task3`
+- `k8s-worker-2-pre-task3`
+
+All three snapshots reported `READY`.
+
+Snapshots are not substitutes for a complete backup strategy. A traditional hypervisor snapshot is primarily a rollback mechanism and may still depend on the same underlying storage.
+
+A real backup design requires independent storage, scheduling, retention, verification, and restore testing.
+
+In Proxmox VE, a backup job would define the protected VM, target storage, schedule, backup mode, and retention.
+
+For example, a Proxmox backup job for `k8s-cp` could run nightly at 02:00 in snapshot mode, write to a Proxmox Backup Server datastore, retain the last 7 daily backups and 4 weekly backups, and include periodic test restores.
+
+In a production environment, Proxmox Backup Server would provide a dedicated backup target with incremental backups, deduplication, verification, retention management, and restore capabilities.
+
+## 5.3 Resource and Networking Hygiene
+
+The GCE `e2-medium` machine type was verified as:
+
+- 2 guest vCPUs
+- 4096 MB RAM
+
+The Kubernetes control-plane VM was verified as using `e2-medium`.
+
+Proxmox-style memory ballooning is not exposed as a configurable Google Compute Engine control.
+
+In Proxmox/QEMU, memory ballooning uses a guest balloon driver that allows the hypervisor to dynamically reclaim unused memory from a VM and later return memory when required.
+
+Under the GCP fallback, CPU and RAM were configured through the GCE machine type. Ballooning was documented rather than falsely claiming that a Proxmox-specific control had been configured.
+
+The cluster IP plan is:
+
+- `k8s-cp` — 10.10.0.10
+- `k8s-worker-1` — 10.10.0.11
+- `k8s-worker-2` — 10.10.0.12
+
+The three addresses were promoted to reserved static internal IPv4 addresses and verified as `IN_USE`.
+
+The MacBook Pro `~/.ssh/config` contains entries for all three nodes.
+
+The following aliases were verified using SSH key authentication:
+
+- `ssh k8s-cp`
+- `ssh k8s-worker-1`
+- `ssh k8s-worker-2`
+
+Each alias returned the correct hostname, the `ubuntu` user, and the expected internal IP.
+
+## Checkpoint Questions
+
+### What does cloud-init do on first boot, and which of its modules did you use?
+
+Cloud-init automates first-boot initialization using metadata and user-data provided by the platform.
+
+In this lab, cloud-init configured the `ubuntu` user, sudo access, SSH authorized key, password SSH policy, root-login policy, root-partition growth, and root-filesystem resize.
+
+The cloud-config used the `users` section and SSH authentication settings (`ssh_authorized_keys`, `ssh_pwauth`, and `disable_root`), together with `growpart` and `resize_rootfs`. GCE supplied instance metadata and network configuration through its cloud datasource.
+
+### Why build a template instead of installing Ubuntu three times from ISO?
+
+A template provides a consistent and reproducible baseline.
+
+It is faster than performing three independent ISO installations, reduces manual configuration and human error, limits configuration drift, and makes it easy to provision additional nodes in the same known state.
+
+### What is the difference between thick and thin provisioning, and which does `local-lvm` use?
+
+Thick provisioning allocates or reserves virtual-disk storage capacity up front.
+
+Thin provisioning allocates physical storage progressively as data is written, allowing the underlying storage pool to be used more efficiently.
+
+Proxmox `local-lvm` uses LVM-thin and therefore uses thin provisioning.
+
+---
+
+# Task 2 Summary
+
+All Task 2 practical requirements were completed successfully using the documented cloud-VM fallback:
+
+- Evaluated the MacBook Pro as a possible local VirtualBox host.
+- Installed and inspected VirtualBox 7.2.16 ARMv8.
+- Selected Google Compute Engine after determining that the MacBook Pro did not have sufficient local resources for three 4 GB Kubernetes VMs.
+- Created a dedicated ShopStack SSH key.
+- Built an Ubuntu 24.04 LTS cloud-init source VM.
+- Verified the `ubuntu` user, SSH key authentication, DHCP networking, hostname, 40 GB boot disk, and expanded root filesystem.
+- Cleaned the source VM with `cloud-init clean` and created the reusable `shopstack-ubuntu2404-template` Machine Image.
+- Provisioned `k8s-cp`, `k8s-worker-1`, and `k8s-worker-2` from the reusable image.
+- Verified all three nodes with passwordless SSH, `cloud-init`, `hostnamectl`, network, and disk checks.
+- Created and verified a snapshot for each Kubernetes node.
+- Verified the `e2-medium` resource allocation of 2 vCPU and 4 GB RAM.
+- Reserved stable internal addresses `10.10.0.10`, `10.10.0.11`, and `10.10.0.12`.
+- Configured `~/.ssh/config` aliases and successfully connected using `ssh k8s-cp`, `ssh k8s-worker-1`, and `ssh k8s-worker-2`.
+- Documented the IP plan, cloud-init template design, snapshot/backup strategy, and Proxmox fallback mappings in the repository.
+
+## Troubleshooting Notes
+
+### VirtualBox CLI was not initially available
+
+**Symptom**
+
+The first VirtualBox version check failed:
+
+```bash
+VBoxManage --version
+```
+
+Result:
+
+```text
+zsh: command not found: VBoxManage
+```
+
+**Cause**
+
+VirtualBox was not installed on the MacBook Pro.
+
+**Resolution**
+
+Installed VirtualBox with Homebrew:
+
+```bash
+brew install --cask virtualbox
+```
+
+Then verified the installation:
+
+```bash
+VBoxManage --version
+```
+
+Result:
+
+```text
+7.2.16r174877
+```
+
+I also inspected the platform capabilities with:
+
+```bash
+VBoxManage list systemproperties
+```
+
+The installed VirtualBox build supported the ARMv8 platform used by the Apple M2 host.
+
+### Local VirtualBox resources were insufficient for the final three-node environment
+
+**Symptom**
+
+I inspected the MacBook Pro hardware:
+
+```bash
+system_profiler SPHardwareDataType \
+  | grep -E 'Model Name|Model Identifier|Chip|Total Number of Cores|Memory'
+```
+
+Key result:
+
+```text
+Model Name: MacBook Pro
+Chip: Apple M2
+Total Number of Cores: 8
+Memory: 8 GB
+```
+
+I also checked available storage:
+
+```bash
+df -h "$HOME"
+```
+
+Key result:
+
+```text
+Available storage: approximately 25 GiB
+```
+
+The required final Kubernetes environment consisted of:
+
+```text
+k8s-cp        4 GB RAM
+k8s-worker-1  4 GB RAM
+k8s-worker-2  4 GB RAM
+```
+
+The guest RAM requirement alone was therefore 12 GB, which already exceeded the MacBook Pro's 8 GB of physical memory before accounting for macOS and VirtualBox overhead.
+
+The limited remaining local disk space also provided little headroom for three VM boot disks and later Kubernetes workloads.
+
+**Cause**
+
+Although VirtualBox itself worked on the Apple M2 host, the MacBook Pro did not have sufficient RAM and storage headroom to run the required three-node final environment reliably.
+
+**Resolution**
+
+The task documentation explicitly allows a cloud-VM fallback when Proxmox hardware is unavailable.
+
+I therefore selected Google Compute Engine for the Final Run.
+
+The final GCP design used:
+
+```text
+k8s-cp        e2-medium   2 vCPU / 4 GB   40 GB pd-standard
+k8s-worker-1  e2-medium   2 vCPU / 4 GB   40 GB pd-standard
+k8s-worker-2  e2-medium   2 vCPU / 4 GB   40 GB pd-standard
+```
+
+This preserved the learning goals of reproducible VM provisioning, cloud-init, template-based deployment, stable networking, and later Ansible automation without overcommitting the MacBook Pro.
+
+### Ephemeral external IP was reused by a different VM
+
+**Symptom**
+
+The source VM originally used the external IPv4 address:
+
+```text
+34.42.37.172
+```
+
+After the source VM was powered off and the Kubernetes nodes were created, GCP assigned the same external address to the new `k8s-cp` VM.
+
+The MacBook Pro still had the previous SSH host key for that IP in `~/.ssh/known_hosts`.
+
+**Cause**
+
+The external address was ephemeral and could be reused by Google Cloud after the original VM stopped using it.
+
+Because the new VM had a different SSH host key, keeping the previous entry could cause an SSH host-key mismatch.
+
+**Resolution**
+
+Removed only the old entry for that IP before connecting to the new VM:
+
+```bash
+ssh-keygen -R 34.42.37.172
+```
+
+This allowed the new `k8s-cp` host key to be accepted cleanly.
+
+### Control-plane hostname initially used the GCE internal FQDN
+
+**Symptom**
+
+Initial verification of `k8s-cp` returned:
+
+```text
+k8s-cp.us-central1-a.c.project-d289b572-dfb9-4c0f-9db.internal
+```
+
+`hostnamectl` also showed:
+
+```text
+Static hostname: (unset)
+```
+
+**Cause**
+
+The control-plane VM was using a transient hostname supplied by Google Compute Engine instead of an explicitly configured static hostname.
+
+**Resolution**
+
+Set explicit static hostnames:
+
+```bash
+sudo hostnamectl set-hostname k8s-cp
+```
+
+```bash
+sudo hostnamectl set-hostname k8s-worker-1
+```
+
+```bash
+sudo hostnamectl set-hostname k8s-worker-2
+```
+
+Verification returned the expected short hostnames:
+
+```text
+k8s-cp
+k8s-worker-1
+k8s-worker-2
+```
+
+This made the node identities consistent for later Ansible and Kubernetes configuration.
+
+### SSH firewall source could not be pinned to one VPN public IP
+
+**Symptom**
+
+The administrator's VPN exit IP changes frequently.
+
+A firewall rule restricted to a single `/32` public IP would therefore stop allowing SSH whenever the VPN endpoint changed.
+
+**Cause**
+
+The VPN uses changing public exit addresses rather than one stable administrator source address.
+
+**Resolution**
+
+For this temporary lab, the SSH firewall rule was configured as:
+
+```text
+Protocol/port: TCP/22
+Source: 0.0.0.0/0
+Target tag: shopstack-k8s
+```
+
+SSH still requires the dedicated ShopStack private key and the rule only applies to VMs carrying the `shopstack-k8s` network tag.
+
+This is a lab convenience and not a production recommendation.
+
+In production, SSH access should instead be restricted to trusted source ranges or provided through a controlled mechanism such as Identity-Aware Proxy, a VPN with stable addressing, or a bastion host.
+
+### macOS `.DS_Store` appeared as an untracked repository file
+
+**Symptom**
+
+Before staging the Task 2 deliverables:
+
+```bash
+git status --short
+```
+
+showed:
+
+```text
+?? .DS_Store
+```
+
+**Cause**
+
+Finder automatically created a macOS `.DS_Store` metadata file in the repository directory.
+
+It was not part of the Task 2 deliverables.
+
+**Resolution**
+
+Removed it before staging:
+
+```bash
+rm -f .DS_Store
+```
+
+A subsequent `git status --short` showed only the intended Task 2 deliverables.
+
+---
+
+**Task 2 status: COMPLETE**
