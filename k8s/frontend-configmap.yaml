@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: shopstack
+data:
+  index.html: |
+    <!doctype html>
+    <html>
+      <body>
+        <h1>ShopStack Frontend</h1>
+        <p>Feature flag: VERSION_B</p>
+      </body>
+    </html>
