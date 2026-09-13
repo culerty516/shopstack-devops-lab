@@ -1,0 +1,137 @@
+name: Build ShopStack Frontend
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build and push multi-arch image
+    runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+      sha_tag: ${{ steps.build.outputs.sha_tag }}
+      build_seconds: ${{ steps.build.outputs.build_seconds }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io \
+                --username "${{ github.actor }}" \
+                --password-stdin
+
+      - name: Build and push multi-arch image
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/shopstack-frontend"
+          SHA_TAG="${IMAGE}:${GITHUB_SHA}"
+
+          TAG_ARGS=(
+            --tag "${SHA_TAG}"
+          )
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            TAG_ARGS+=(
+              --tag "${IMAGE}:${VERSION}"
+            )
+          fi
+
+          START_TIME=$(date +%s)
+
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --push \
+            --cache-from type=gha,scope=shopstack-frontend \
+            --cache-to type=gha,mode=max,scope=shopstack-frontend \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            "${TAG_ARGS[@]}" \
+            frontend-src
+
+          END_TIME=$(date +%s)
+          BUILD_SECONDS=$((END_TIME - START_TIME))
+
+          echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
+          echo "sha_tag=${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "build_seconds=${BUILD_SECONDS}" >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Multi-arch image build"
+            echo
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Git SHA tag: \`${GITHUB_SHA}\`"
+            echo "- Platforms: \`linux/amd64,linux/arm64\`"
+            echo "- Build time: **${BUILD_SECONDS} seconds**"
+            echo "- Cache: GitHub Actions Buildx cache"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  scan:
+    name: Trivy CRITICAL vulnerability gate
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io \
+                --username "${{ github.actor }}" \
+                --password-stdin
+
+      - name: Scan AMD64 image
+        run: |
+          docker run --rm \
+            aquasec/trivy:0.74.0 \
+            image \
+            --scanners vuln \
+            --exit-code 1 \
+            --severity CRITICAL \
+            --platform linux/amd64 \
+            "${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha_tag }}"
+
+      - name: Scan ARM64 image
+        run: |
+          docker run --rm \
+            aquasec/trivy:0.74.0 \
+            image \
+            --scanners vuln \
+            --exit-code 1 \
+            --severity CRITICAL \
+            --platform linux/arm64 \
+            "${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha_tag }}"
+
+      - name: Record build time
+        run: |
+          {
+            echo "### CI result"
+            echo
+            echo "- Multi-arch build time: **${{ needs.build.outputs.build_seconds }} seconds**"
+            echo "- Trivy gate: no CRITICAL vulnerabilities detected"
+          } >> "${GITHUB_STEP_SUMMARY}"
