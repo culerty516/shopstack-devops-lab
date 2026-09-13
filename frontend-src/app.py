@@ -4,7 +4,7 @@ from flask import Flask
 
 app = Flask(__name__)
 
-APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
+APP_VERSION = os.getenv("APP_VERSION", "0.2.0")
 
 
 @app.get("/")
@@ -18,6 +18,7 @@ def index():
 <body>
   <h1>Hello from ShopStack!</h1>
   <p>Version: {APP_VERSION}</p>
+  <p>Release: Kubernetes-ready frontend</p>
 </body>
 </html>
 """
