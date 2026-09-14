@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shopstack-frontend-v1
+  namespace: shopstack
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shopstack-frontend-canary
+      version: v1
+  template:
+    metadata:
+      labels:
+        app: shopstack-frontend-canary
+        version: v1
+    spec:
+      serviceAccountName: shopstack-frontend
+      containers:
+        - name: frontend
+          image: ghcr.io/culerty516/shopstack-frontend:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: APP_VERSION
+              value: "0.1.0"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shopstack-frontend-v2
+  namespace: shopstack
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shopstack-frontend-canary
+      version: v2
+  template:
+    metadata:
+      labels:
+        app: shopstack-frontend-canary
+        version: v2
+    spec:
+      serviceAccountName: shopstack-frontend
+      containers:
+        - name: frontend
+          image: ghcr.io/culerty516/shopstack-frontend:0.2.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: APP_VERSION
+              value: "0.2.0"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shopstack-frontend-canary
+  namespace: shopstack
+spec:
+  selector:
+    app: shopstack-frontend-canary
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

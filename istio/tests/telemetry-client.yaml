@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: telemetry-client
+  namespace: shopstack
+  labels:
+    app: telemetry-client
+spec:
+  containers:
+    - name: curl
+      image: curlimages/curl:8.10.1
+      command:
+        - sh
+        - -c
+        - sleep 86400
+  restartPolicy: Never

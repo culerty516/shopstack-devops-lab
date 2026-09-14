@@ -17,6 +17,7 @@ spec:
         app: frontend
         app.kubernetes.io/name: shopstack-frontend
     spec:
+      serviceAccountName: shopstack-frontend
       containers:
         - name: server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

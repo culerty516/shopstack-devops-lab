@@ -1,4 +1,4 @@
-# DevOps Pre-Onboarding Practice — Task 1 Journal
+# DevOps Pre-Onboarding Practice — Journal
 
 ## Task 1 — Linux Foundations
 
@@ -5883,4 +5883,1311 @@ Before committing the Task 4 application artifacts, I restored the actual `0.1.0
 ---
 
 **Task 4 status: COMPLETE**
+---
+
+# Task 5 — Istio Service Mesh
+
+**Date completed:** 2026-09-14<br>
+**Working machine:** MacBook Pro (Apple M2, arm64)<br>
+**Primary Kubernetes environment:** Three-node kubeadm cluster on Google Compute Engine<br>
+**Kubernetes version:** v1.37.0<br>
+**Container runtime:** containerd 2.2.1<br>
+**Application namespace:** `shopstack`<br>
+**Istio version:** 1.31.0<br>
+**Istio installation profile:** `demo`<br>
+**Kubernetes context:** `kubernetes-admin@kubernetes`<br>
+**Local kubeconfig:** `~/.kube/task4-final-config`
+
+Task 5 reused the Task 4 kubeadm environment. At the start of the task, the repository was on `main` at:
+
+```text
+32b2aa3 Complete Task 4 Kubernetes and Helm
+```
+
+The cluster consisted of:
+
+```text
+k8s-cp        10.10.0.10   control-plane   v1.37.0
+k8s-worker-1  10.10.0.11   worker          v1.37.0
+k8s-worker-2  10.10.0.12   worker          v1.37.0
+```
+
+The Kubernetes API remained private. Local `kubectl` access from the MacBook Pro continued to use the SSH tunnel from Task 3/4:
+
+```text
+127.0.0.1:6443 -> k8s-cp 10.10.0.10:6443
+```
+
+---
+
+# 8.1 Installation and Sidecar Injection
+
+## 8.1.1 Install Istio with the `demo` Profile
+
+The `istio-system` namespace did not exist at the start of the task, and `istioctl` was not yet installed on the MacBook Pro.
+
+I downloaded Istio 1.31.0 for Apple Silicon:
+
+```bash
+mkdir -p "$HOME/.local/share/istio"
+cd "$HOME/.local/share/istio"
+
+curl -L https://istio.io/downloadIstio | \
+  ISTIO_VERSION=1.31.0 TARGET_ARCH=arm64 sh -
+```
+
+The downloaded client was verified as:
+
+```text
+Mach-O 64-bit executable arm64
+client version: 1.31.0
+```
+
+I installed `istioctl` persistently in the Homebrew binary path:
+
+```bash
+install -m 0755 \
+  "$HOME/.local/share/istio/istio-1.31.0/bin/istioctl" \
+  /opt/homebrew/bin/istioctl
+```
+
+Verification:
+
+```bash
+command -v istioctl
+istioctl version --remote=false
+```
+
+Result:
+
+```text
+/opt/homebrew/bin/istioctl
+client version: 1.31.0
+```
+
+Before installation I ran the Istio precheck:
+
+```bash
+istioctl x precheck
+```
+
+Result:
+
+```text
+✔ No issues found when checking the cluster. Istio is safe to install or upgrade!
+```
+
+I installed the required demo profile:
+
+```bash
+istioctl install --set profile=demo -y
+```
+
+Key result:
+
+```text
+✔ Istio core installed
+✔ Istiod installed
+✔ Egress gateways installed
+✔ Ingress gateways installed
+✔ Installation complete
+```
+
+The control plane was verified:
+
+```bash
+kubectl get pods -n istio-system -o wide
+```
+
+Key result:
+
+```text
+istio-egressgateway    1/1 Running
+istio-ingressgateway   1/1 Running
+istiod                 1/1 Running
+```
+
+Version verification returned:
+
+```text
+client version: 1.31.0
+control plane version: 1.31.0
+data plane version: 1.31.0
+```
+
+The ingress gateway Service was a `LoadBalancer` with a pending external IP, which is expected in this bare kubeadm/GCP lab without a Kubernetes LoadBalancer implementation. I therefore used `kubectl port-forward` for local ingress verification.
+
+---
+
+## 8.1.2 Enable Automatic Sidecar Injection
+
+Before enabling injection, the `shopstack` Pods were normal single-container application Pods.
+
+I labeled the namespace:
+
+```bash
+kubectl label namespace shopstack \
+  istio-injection=enabled \
+  --overwrite
+```
+
+Verification showed:
+
+```text
+istio-injection=enabled
+```
+
+I restarted all application Deployments so the admission webhook could inject Envoy:
+
+```bash
+kubectl rollout restart deployment -n shopstack
+```
+
+I waited for every Deployment to complete its rollout.
+
+Afterward, application Pods reported `2/2` READY, for example:
+
+```text
+adservice               2/2 Running
+cartservice             2/2 Running
+frontend                2/2 Running
+productcatalogservice   2/2 Running
+shippingservice         2/2 Running
+```
+
+I also verified registration with Istio:
+
+```bash
+istioctl proxy-status
+```
+
+All ShopStack sidecars were connected to Istiod 1.31.0 and subscribed to the expected xDS types:
+
+```text
+CDS, LDS, EDS, RDS
+```
+
+### What the sidecar proxy intercepts
+
+In sidecar mode, Istio injects an Envoy proxy alongside the application container. Traffic entering and leaving the workload is transparently redirected through Envoy. This lets the mesh provide capabilities such as:
+
+- workload-to-workload mTLS and identity;
+- Layer 7 routing and traffic splitting;
+- retries and timeouts;
+- fault injection;
+- authorization policy enforcement;
+- telemetry, metrics, and distributed tracing.
+
+The application itself does not need to implement these service-mesh features directly.
+
+### Sidecar mode vs ambient mesh
+
+The newer ambient model removes the requirement for one Envoy sidecar in every application Pod. Instead, node-level `ztunnel` proxies provide the secure Layer 4 data plane, including workload identity and mTLS. Optional waypoint proxies can provide Layer 7 processing where it is required.
+
+The practical difference is:
+
+```text
+Sidecar mode:
+application Pod + per-Pod Envoy
+
+Ambient mode:
+application Pod without sidecar
+        |
+        +-- node-level ztunnel for L4 security/identity
+        +-- optional waypoint for L7 policy/routing
+```
+
+Ambient mode can reduce per-Pod proxy overhead and can enroll workloads without restarting them for sidecar injection. This task required sidecar mode only, so ambient mesh was documented but not deployed.
+
+---
+
+# 8.2 Ingress Gateway and Traffic Management
+
+## 8.2.1 Replace the Plain Kubernetes Ingress
+
+Task 4 had a Helm-managed nginx Ingress:
+
+```text
+name: shopstack
+class: nginx
+host: shopstack.local
+backend: frontend:80
+```
+
+The Helm release had:
+
+```text
+ingress.enabled: true
+```
+
+Because Task 5 required the plain Ingress to be replaced by Istio, I changed the chart default:
+
+```yaml
+ingress:
+  enabled: false
+```
+
+I validated the chart:
+
+```bash
+helm lint charts/frontend-chart
+```
+
+Result:
+
+```text
+1 chart(s) linted, 0 chart(s) failed
+```
+
+I also rendered the chart and confirmed that it no longer produced an `Ingress`.
+
+I created:
+
+```text
+istio/gateway.yaml
+istio/virtualservice.yaml
+```
+
+The Gateway listened for HTTP traffic on `shopstack.local`, using the Istio ingress gateway selector.
+
+The initial VirtualService routed:
+
+```text
+shopstack.local
+    |
+    v
+frontend.shopstack.svc.cluster.local:80
+```
+
+I applied both resources:
+
+```bash
+kubectl apply -f istio/gateway.yaml
+kubectl apply -f istio/virtualservice.yaml
+```
+
+Validation:
+
+```bash
+istioctl analyze -n shopstack
+```
+
+Result:
+
+```text
+✔ No validation issues found when analyzing namespace: shopstack.
+```
+
+Before removing the old Ingress, I proved that the Istio path already worked:
+
+```bash
+kubectl port-forward \
+  -n istio-system \
+  svc/istio-ingressgateway \
+  18080:80
+```
+
+Then:
+
+```bash
+curl -H 'Host: shopstack.local' \
+  http://127.0.0.1:18080/
+```
+
+returned:
+
+```text
+HTTP 200
+Version: 32b2aa3a1be201d9707848c9305646e9b0409249
+```
+
+I then upgraded the Helm release using the already-deployed immutable image tag while keeping `ingress.enabled=false`.
+
+The release moved to revision 4, and:
+
+```bash
+kubectl get ingress -n shopstack
+```
+
+returned:
+
+```text
+No resources found in shopstack namespace.
+```
+
+The live frontend image remained unchanged, and the Istio Gateway path continued to return HTTP `200`.
+
+This completed the cutover without changing the application image.
+
+---
+
+## 8.2.2 Canary Release — `0.1.0` and `0.2.0`
+
+I verified the two ShopStack frontend images.
+
+`0.1.0` was an AMD64 OCI image:
+
+```text
+ghcr.io/culerty516/shopstack-frontend:0.1.0
+Platform: linux/amd64
+```
+
+`0.2.0` was the multi-architecture image index containing:
+
+```text
+linux/amd64
+linux/arm64
+```
+
+The application exposes its visible version through `APP_VERSION`, so the two releases could be distinguished in HTTP responses.
+
+I created:
+
+```text
+istio/canary-workloads.yaml
+```
+
+with:
+
+```text
+shopstack-frontend-v1 -> image 0.1.0 -> APP_VERSION=0.1.0
+shopstack-frontend-v2 -> image 0.2.0 -> APP_VERSION=0.2.0
+```
+
+Both Pods used:
+
+```text
+app=shopstack-frontend-canary
+```
+
+and were separated by:
+
+```text
+version=v1
+version=v2
+```
+
+A dedicated Service selected the canary application label:
+
+```text
+shopstack-frontend-canary
+```
+
+Both versions rolled out successfully as `2/2 Running`.
+
+I verified the versions directly by port-forwarding each Deployment.
+
+v1 returned:
+
+```text
+Version: 0.1.0
+```
+
+v2 returned:
+
+```text
+Version: 0.2.0
+Release: Kubernetes-ready frontend
+```
+
+I created:
+
+```text
+istio/destinationrule.yaml
+```
+
+with two subsets:
+
+```yaml
+subsets:
+  - name: v1
+    labels:
+      version: v1
+  - name: v2
+    labels:
+      version: v2
+```
+
+I then updated `istio/virtualservice.yaml` to route:
+
+```text
+90% -> v1
+10% -> v2
+```
+
+A loop of 100 requests through the Istio ingress gateway produced:
+
+```text
+91 0.1.0
+ 9 0.2.0
+```
+
+Calculated result:
+
+```text
+v0.1.0: 91 / 100 = 91%
+v0.2.0:  9 / 100 = 9%
+```
+
+The exact result is probabilistic, but this was consistent with the configured 90/10 weighted split.
+
+---
+
+## 8.2.3 Timeout, Retry, and Fault Injection
+
+The final VirtualService was extended with:
+
+```yaml
+timeout: 3s
+retries:
+  attempts: 2
+  perTryTimeout: 1s
+  retryOn: 5xx,reset,connect-failure,refused-stream
+```
+
+The 90/10 canary routing remained in place.
+
+For the controlled fault test I created:
+
+```text
+istio/tests/virtualservice-delay-test.yaml
+```
+
+The temporary test route matched this header:
+
+```text
+x-istio-fault: delay
+```
+
+and applied:
+
+```yaml
+fault:
+  delay:
+    percentage:
+      value: 100
+    fixedDelay: 2s
+```
+
+Before applying the fault configuration, three baseline requests were:
+
+```text
+HTTP 200 | time=0.534534s
+HTTP 200 | time=0.525886s
+HTTP 200 | time=0.526400s
+```
+
+With the `2s` fault applied, three matching requests returned:
+
+```text
+HTTP 200 | time=2.632622s
+HTTP 200 | time=2.698547s
+HTTP 200 | time=2.775500s
+```
+
+The responses remained successful, but the approximately two-second increase in latency demonstrated that Istio fault injection was active.
+
+I then immediately restored the normal tracked VirtualService:
+
+```bash
+kubectl apply -f istio/virtualservice.yaml
+```
+
+and verified:
+
+```text
+HTTP 200 | time=0.835131s
+```
+
+`istioctl analyze -n shopstack` remained clean after the test.
+
+---
+
+# 8.3 Security and Observability
+
+## 8.3.1 Strict mTLS
+
+Before applying a `PeerAuthentication`, no peer authentication resources existed:
+
+```bash
+kubectl get peerauthentication -A
+```
+
+Result:
+
+```text
+No resources found
+```
+
+I created a deliberately non-mesh client in the `default` namespace with:
+
+```yaml
+sidecar.istio.io/inject: "false"
+```
+
+The Pod was `1/1 Running`, proving it had no Envoy sidecar.
+
+Before strict mTLS, it could reach the canary Service:
+
+```text
+HTTP 200
+```
+
+I created:
+
+```text
+istio/peer-authentication.yaml
+```
+
+with:
+
+```yaml
+spec:
+  mtls:
+    mode: STRICT
+```
+
+After applying it to `shopstack`, the exact same plaintext request failed:
+
+```text
+HTTP 000
+curl: (56) Recv failure: Connection reset by peer
+curl_exit_code=56
+```
+
+At the same time, traffic entering through the Istio ingress gateway still returned:
+
+```text
+HTTP 200
+```
+
+All application Pods remained `2/2 Running`, and:
+
+```bash
+istioctl analyze -n shopstack
+```
+
+returned no validation issues.
+
+This demonstrated that plaintext traffic from outside the mesh was rejected while mesh-managed traffic continued to work.
+
+The temporary plaintext test Pod was deleted afterward.
+
+---
+
+## 8.3.2 Workload Identity and AuthorizationPolicy
+
+The existing Helm frontend was initially using the Kubernetes `default` ServiceAccount. Allowing:
+
+```text
+cluster.local/ns/shopstack/sa/default
+```
+
+would not have represented a frontend-only identity because any workload using the same ServiceAccount would share that principal.
+
+I therefore created a dedicated Helm-managed ServiceAccount:
+
+```text
+shopstack-frontend
+```
+
+The following Task 5 chart changes were made:
+
+```text
+charts/frontend-chart/templates/serviceaccount.yaml
+charts/frontend-chart/templates/deployment.yaml
+```
+
+The Helm frontend Deployment now uses:
+
+```yaml
+serviceAccountName: shopstack-frontend
+```
+
+The two canary Deployments were also updated to use the same frontend identity.
+
+After the Helm upgrade and canary rollouts, all frontend Pods used:
+
+```text
+SERVICEACCOUNT
+shopstack-frontend
+```
+
+I created:
+
+```text
+istio/authorization-policy.yaml
+```
+
+targeting:
+
+```text
+app=productcatalogservice
+```
+
+and allowing only:
+
+```text
+cluster.local/ns/shopstack/sa/shopstack-frontend
+```
+
+To prove the policy, I created two temporary mesh clients:
+
+```text
+frontend-authz-client -> ServiceAccount shopstack-frontend
+authz-test-client     -> ServiceAccount authz-test
+```
+
+The allowed frontend identity reached the product catalog workload and received:
+
+```text
+HTTP/1.1 415 Unsupported Media Type
+content-type: application/grpc
+grpc-status: 3
+grpc-message: invalid gRPC request content-type ""
+```
+
+The request was intentionally sent with ordinary `curl` to a gRPC service. The `415` response demonstrated that the request passed Istio authorization and reached the service/protocol layer; importantly, it was not denied by RBAC.
+
+The other ServiceAccount was rejected by Envoy:
+
+```text
+HTTP/1.1 403 Forbidden
+server: envoy
+
+RBAC: access denied
+```
+
+This proved that the AuthorizationPolicy was enforcing workload identity rather than simply allowing all mesh traffic.
+
+The temporary authorization test resources were deleted afterward.
+
+---
+
+## 8.3.3 Prometheus, Grafana, Kiali, and Jaeger
+
+I used the observability manifests shipped with the same Istio 1.31.0 release:
+
+```text
+samples/addons/prometheus.yaml
+samples/addons/grafana.yaml
+samples/addons/kiali.yaml
+samples/addons/jaeger.yaml
+```
+
+All four Deployments completed successfully:
+
+```text
+grafana      1/1
+jaeger       1/1
+kiali        1/1
+prometheus   1/1
+```
+
+Prometheus itself ran as a `2/2` Pod in this sample configuration.
+
+The kubeadm cluster did not expose the Kubernetes Metrics API:
+
+```text
+error: Metrics API not available
+```
+
+for `kubectl top`. This did not block Task 5 because Istio's Prometheus telemetry pipeline was independent and worked correctly.
+
+### Enable tracing
+
+I inspected the Istio MeshConfig and confirmed the existing Jaeger OpenTelemetry provider:
+
+```yaml
+name: jaeger
+opentelemetry:
+  port: 4317
+  service: jaeger-collector.istio-system.svc.cluster.local
+```
+
+There was initially no `Telemetry` resource.
+
+I created:
+
+```text
+istio/telemetry.yaml
+```
+
+with:
+
+```yaml
+tracing:
+  - providers:
+      - name: jaeger
+    randomSamplingPercentage: 100
+```
+
+The 100% sample rate was used specifically for this lab evidence.
+
+I also created a temporary injected `telemetry-client` so I could generate controlled mesh traffic.
+
+### Generate telemetry
+
+I generated:
+
+- 100 internal mesh requests from `telemetry-client` to `frontend`;
+- 100 requests through the Istio ingress gateway;
+- controlled `404` requests so Grafana would have error-rate data.
+
+Prometheus reported a populated `istio_requests_total` dataset and response-code metrics including both `200` and `404`.
+
+Jaeger listed application services including:
+
+```text
+frontend.shopstack
+loadgenerator.shopstack
+shopstack-frontend-canary.shopstack
+telemetry-client.shopstack
+```
+
+A trace query returned multiple two-span traces containing both:
+
+```text
+frontend.shopstack
+loadgenerator.shopstack
+```
+
+### Kiali evidence
+
+Kiali was port-forwarded locally on port `20001`.
+
+The healthy service graph showed the `shopstack` namespace with multiple applications/services/edges, including the canary versions, and a clean capture showed:
+
+```text
+HTTP success: 100%
+Error: 0%
+```
+
+A separate Kiali capture visibly showed the mTLS lock indicators.
+
+#### Healthy service graph
+
+![Kiali healthy service graph](docs/evidence/task5/kiali-healthy-service-graph.png)
+
+#### mTLS lock verification
+
+![Kiali mTLS lock verification](docs/evidence/task5/kiali-mtls-lock-verification.png)
+
+The first graph attempts showed persistent failures even after manually generated traffic was healthy. I used Prometheus to isolate the active non-2xx source:
+
+```text
+source=loadgenerator
+destination=frontend
+code=404
+rate=4.252631578947368
+```
+
+The root cause was that the Online Boutique `loadgenerator` continued requesting routes such as `/cart`, `/product/...`, and `/setCurrency`, while the Task 4 custom Flask frontend only implemented its smaller lab route set.
+
+Loadgenerator logs confirmed those requests were failing continuously while `/` remained successful.
+
+For a clean evidence window I temporarily scaled `loadgenerator` from one replica to zero, waited for the previous errors to leave the short metrics window, generated only successful traffic, captured the healthy graph, and then immediately restored the Deployment to one replica.
+
+Final restoration:
+
+```text
+deployment/loadgenerator   1/1
+pod/loadgenerator          2/2 Running
+```
+
+### Grafana evidence
+
+Grafana's Istio Mesh Dashboard was captured using the Prometheus datasource.
+
+The evidence showed:
+
+```text
+Traffic Volume: 2.22 req/s
+Success Rate:   100%
+4xx:            2.16 req/s
+5xx:            0 req/s
+```
+
+This provided the required request-rate and error-rate visualization.
+
+![Grafana request and error rates](docs/evidence/task5/grafana-request-error-rates.png)
+
+### Jaeger evidence
+
+The captured Jaeger trace detail showed:
+
+```text
+Services:    2
+Depth:       2
+Total Spans: 2
+```
+
+with the distributed path:
+
+```text
+loadgenerator.shopstack
+        |
+        v
+frontend.shopstack
+```
+
+This satisfied the distributed-tracing evidence requirement.
+
+![Jaeger distributed trace](docs/evidence/task5/jaeger-distributed-trace.png)
+
+### Observability evidence stored in the repository
+
+The final Task 5 observability screenshots are stored under:
+
+```text
+docs/evidence/task5/
+├── kiali-healthy-service-graph.png
+├── kiali-mtls-lock-verification.png
+├── grafana-request-error-rates.png
+└── jaeger-distributed-trace.png
+```
+
+These screenshots document the Kiali service graph and mTLS state, Grafana request/error rates, and Jaeger distributed trace captured during the Final Run.
+
+---
+
+## 8.3.4 `istioctl analyze` and Sidecar Configuration Inspection
+
+The final namespace analysis was clean:
+
+```bash
+istioctl analyze -n shopstack
+```
+
+Result:
+
+```text
+✔ No validation issues found when analyzing namespace: shopstack.
+```
+
+Final proxy status showed the ShopStack data plane and gateways registered with Istiod 1.31.0.
+
+I selected the v1 canary sidecar:
+
+```text
+shopstack-frontend-v1-6d4c4b987-254fx
+```
+
+The Pod was:
+
+```text
+2/2 Running
+```
+
+I inspected its Envoy configuration with:
+
+```bash
+istioctl proxy-config clusters
+istioctl proxy-config listeners
+istioctl proxy-config routes
+istioctl proxy-config endpoints
+```
+
+### Clusters
+
+The sidecar contained outbound clusters for:
+
+```text
+frontend.shopstack.svc.cluster.local
+productcatalogservice.shopstack.svc.cluster.local
+shopstack-frontend-canary.shopstack.svc.cluster.local
+```
+
+The canary destination also contained the expected subset clusters:
+
+```text
+v1
+v2
+```
+
+### Listeners
+
+The listener configuration showed Envoy routes/listeners for the application and mesh service ports, including HTTP traffic on ports such as `80`, `3550`, `8080`, and the observability services.
+
+### Routes
+
+The route table contained entries for ShopStack services, the canary Service, Istio observability services, and the local inbound application route.
+
+### Endpoints
+
+The canary endpoints were both healthy:
+
+```text
+10.244.2.44:8080   HEALTHY   outbound|80|v1|shopstack-frontend-canary...
+10.244.1.46:8080   HEALTHY   outbound|80|v2|shopstack-frontend-canary...
+```
+
+Final security resources were also present:
+
+```text
+PeerAuthentication/default                    STRICT
+AuthorizationPolicy/productcatalog-frontend-only   ALLOW
+```
+
+---
+
+# Checkpoint Questions
+
+## 1. What is the difference between a `VirtualService` and a `DestinationRule`?
+
+A `VirtualService` defines **how traffic is routed**. It can match requests by host, URI, headers, or other attributes, choose one or more destinations, apply weights, and configure traffic behavior such as retries, timeouts, redirects, or fault injection.
+
+A `DestinationRule` defines policies for traffic **after the destination has been selected**. It can define named subsets using workload labels and can also configure destination-side traffic policies such as load balancing, connection pools, outlier detection, and TLS behavior.
+
+In this task:
+
+```text
+VirtualService:
+90% -> v1
+10% -> v2
+timeout/retry configuration
+
+DestinationRule:
+v1 -> version=v1
+v2 -> version=v2
+```
+
+In short:
+
+```text
+VirtualService  -> where/how to route the request
+DestinationRule -> how to treat the selected destination/subsets
+```
+
+---
+
+## 2. Why does strict mTLS break health checks or legacy clients, and what is `PERMISSIVE` mode for?
+
+`STRICT` mTLS requires protected workload traffic to authenticate with Istio-issued mutual-TLS credentials. A legacy client or a non-mesh Pod sending ordinary plaintext directly to a workload cannot complete that mTLS exchange and is rejected.
+
+This was demonstrated directly in the lab:
+
+```text
+Before STRICT:
+HTTP 200
+
+After STRICT:
+HTTP 000
+Recv failure: Connection reset by peer
+```
+
+Health checking requires care because not every probe or external health-check source necessarily participates in the mesh. Istio sidecars support Kubernetes probe handling/rewrite behavior, but arbitrary legacy plaintext clients are not automatically converted into mesh identities.
+
+`PERMISSIVE` mode accepts both plaintext and Istio mTLS. It is useful as a migration mode while workloads are progressively enrolled into the mesh or while compatibility with legacy callers is still required. Once all intended callers can use mesh mTLS, `STRICT` provides the stronger steady-state policy.
+
+---
+
+## 3. Where does workload identity come from in Istio, and how does it relate to SPIFFE?
+
+Istio workload identity is derived primarily from the Kubernetes trust domain, namespace, and ServiceAccount.
+
+For the dedicated frontend identity in this task, the SPIFFE-style identity is:
+
+```text
+spiffe://cluster.local/ns/shopstack/sa/shopstack-frontend
+```
+
+Istiod provides workload certificates to Envoy, and mTLS uses those certificates to authenticate peers.
+
+AuthorizationPolicy can then authorize the authenticated identity. The policy used in this task allowed:
+
+```text
+cluster.local/ns/shopstack/sa/shopstack-frontend
+```
+
+to call the product catalog workload, while a different ServiceAccount was rejected with:
+
+```text
+RBAC: access denied
+```
+
+Therefore the ServiceAccount is not just a Kubernetes organizational label; in the mesh it becomes part of the cryptographically authenticated workload identity.
+
+---
+
+# Task 5 Summary
+
+All Task 5 practical requirements were completed successfully:
+
+- Installed Istio 1.31.0 using the `demo` profile.
+- Verified Istiod, ingress gateway, and egress gateway health.
+- Enabled automatic sidecar injection in `shopstack`.
+- Restarted application Deployments and verified `2/2` Pods plus `istioctl proxy-status`.
+- Documented sidecar interception and the conceptual difference between sidecar and ambient mesh.
+- Disabled the Task 4 Helm-managed plain Ingress.
+- Created an Istio `Gateway` and `VirtualService` for `shopstack.local`.
+- Deployed visible `0.1.0` and `0.2.0` frontend canary versions.
+- Created a `DestinationRule` with `v1` and `v2` subsets.
+- Configured 90/10 weighted routing and proved it with 100 requests (`91/9` observed).
+- Added a 3-second timeout and two retry attempts.
+- Demonstrated a 2-second Istio fault delay with measured request latency.
+- Enabled namespace-wide `STRICT` mTLS.
+- Proved that a non-mesh plaintext client changed from HTTP `200` to connection reset/HTTP `000`.
+- Added the dedicated `shopstack-frontend` ServiceAccount.
+- Restricted Product Catalog access to the frontend workload identity.
+- Proved another ServiceAccount was denied with `HTTP 403` and `RBAC: access denied`.
+- Installed Prometheus, Grafana, Kiali, and Jaeger from the Istio 1.31.0 sample manifests.
+- Enabled 100% Jaeger sampling for lab evidence with an Istio `Telemetry` resource.
+- Generated mesh traffic and verified Prometheus metrics.
+- Captured a Kiali service graph and mTLS lock evidence.
+- Captured a Grafana dashboard with request and error rates.
+- Captured a two-service Jaeger distributed trace.
+- Ran final `istioctl analyze` successfully.
+- Inspected one sidecar with `istioctl proxy-config clusters`, `listeners`, `routes`, and `endpoints`.
+- Verified final `PeerAuthentication` and `AuthorizationPolicy` resources.
+
+## Final Task 5 Repository Artifacts
+
+Required Task 5 deliverables:
+
+```text
+istio/
+├── authorization-policy.yaml
+├── destinationrule.yaml
+├── gateway.yaml
+├── peer-authentication.yaml
+└── virtualservice.yaml
+```
+
+Additional Task 5 implementation/evidence manifests created during the Final Run:
+
+```text
+istio/
+├── canary-workloads.yaml
+├── telemetry.yaml
+└── tests/
+    ├── authz-test-client.yaml
+    ├── plaintext-client.yaml
+    ├── telemetry-client.yaml
+    └── virtualservice-delay-test.yaml
+```
+
+Supporting Helm-chart changes:
+
+```text
+charts/frontend-chart/
+├── values.yaml
+└── templates/
+    ├── deployment.yaml
+    └── serviceaccount.yaml
+```
+
+Observability evidence:
+
+```text
+docs/evidence/task5/
+├── kiali-healthy-service-graph.png
+├── kiali-mtls-lock-verification.png
+├── grafana-request-error-rates.png
+└── jaeger-distributed-trace.png
+```
+
+The Task 5 implementation and repository evidence are complete. The observability screenshots are stored under `docs/evidence/task5/` and linked in Section 8.3.3.
+
+---
+
+# Troubleshooting Notes
+
+## Existing SSH tunnel caused an initial `Address already in use`
+
+**Symptom**
+
+At the start of Task 5, attempting to create the local API tunnel returned:
+
+```text
+bind [127.0.0.1]:6443: Address already in use
+Could not request local forwarding.
+```
+
+**Cause**
+
+The existing tunnel from the earlier task was already listening on local port `6443`.
+
+**Resolution**
+
+I verified the cluster directly with:
+
+```bash
+kubectl get nodes -o wide
+```
+
+All three nodes were Ready, proving that the existing tunnel was already functional. No tunnel or cluster change was required at that point.
+
+---
+
+## Kubernetes Metrics API was not available
+
+**Symptom**
+
+```bash
+kubectl top nodes
+kubectl top pods -n istio-system
+```
+
+returned:
+
+```text
+error: Metrics API not available
+```
+
+**Cause**
+
+The kubeadm cluster did not have a working Kubernetes Metrics API available for `kubectl top`.
+
+**Resolution**
+
+No change was required for Task 5. Istio Prometheus was installed separately and successfully collected `istio_requests_total` and response-code telemetry, which was the required observability path for this task.
+
+---
+
+## The local Kubernetes API SSH tunnel expired during Kiali evidence capture
+
+**Symptom**
+
+A Kiali port-forward exited, and subsequent `kubectl` commands returned:
+
+```text
+The connection to the server 127.0.0.1:6443 was refused
+```
+
+`lsof` showed no listener on local port `6443`.
+
+**Cause**
+
+The SSH tunnel to the private kubeadm API had ended during the longer observability session.
+
+**Resolution**
+
+Re-established only the existing local forward:
+
+```bash
+ssh -fN \
+  -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:6443:10.10.0.10:6443 \
+  k8s-cp
+```
+
+Kubernetes access returned immediately. The Kiali Pod remained `1/1 Running`, and the Kiali port-forward subsequently returned HTTP `200`. No Kubernetes or Istio resource needed to be changed.
+
+---
+
+## Temporary telemetry client completed after one hour
+
+**Symptom**
+
+The temporary client later showed:
+
+```text
+telemetry-client   0/2   Completed
+```
+
+**Cause**
+
+Its helper container had been created with:
+
+```text
+sleep 3600
+```
+
+and the observability/evidence session lasted longer than one hour.
+
+**Resolution**
+
+Changed only the helper lifetime:
+
+```text
+sleep 3600
+->
+sleep 86400
+```
+
+The Pod was recreated and returned:
+
+```text
+2/2 Running
+```
+
+No Istio configuration change was required.
+
+---
+
+## Kiali initially showed persistent failures despite successful manual requests
+
+**Symptom**
+
+Kiali continued to show failing application/service/workload health even after manually generated gateway traffic returned only HTTP `200`.
+
+A 200-request validation showed:
+
+```text
+HTTP 200: 200
+Failed/non-200: 0
+```
+
+**Investigation**
+
+A Prometheus query grouped non-2xx traffic by source, destination, and response code.
+
+The only active failing source was:
+
+```text
+source=loadgenerator
+destination=frontend
+code=404
+rate=4.252631578947368
+```
+
+The loadgenerator log showed that `/` succeeded but the original Online Boutique paths such as `/cart`, `/product/...`, `/cart/checkout`, and `/setCurrency` were continuously failing.
+
+**Cause**
+
+The Online Boutique loadgenerator expected the original full Online Boutique frontend route set. Task 4 had replaced the `frontend` workload with the custom ShopStack Flask frontend, which intentionally implements a much smaller route set.
+
+This was an application traffic-pattern mismatch, not an Istio routing or mTLS failure.
+
+**Resolution**
+
+For the clean Kiali evidence window only, I recorded the original replica count, temporarily scaled `loadgenerator` to zero, waited for old errors to leave the short metrics window, generated only successful traffic, and verified that the one-minute non-2xx Prometheus query returned no active failures.
+
+I then restored the original replica count:
+
+```text
+deployment/loadgenerator   1/1
+pod/loadgenerator          2/2 Running
+```
+
+This preserved the normal application state after evidence capture.
+
+---
+
+## The first loadgenerator log command used the wrong container name
+
+**Symptom**
+
+```text
+error: container server is not valid for pod ...
+```
+
+**Cause**
+
+The Online Boutique loadgenerator container was named `main`, not `server`.
+
+**Resolution**
+
+I inspected the Pod's container names and then used:
+
+```text
+-c main
+```
+
+to retrieve the loadgenerator logs successfully.
+
+---
+
+**Task 5 status: COMPLETE**
 ---

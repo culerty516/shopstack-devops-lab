@@ -1,0 +1,39 @@
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: shopstack
+  namespace: shopstack
+spec:
+  hosts:
+    - shopstack.local
+  gateways:
+    - shopstack-gateway
+  http:
+    - match:
+        - headers:
+            x-istio-fault:
+              exact: delay
+      fault:
+        delay:
+          percentage:
+            value: 100
+          fixedDelay: 2s
+      route:
+        - destination:
+            host: shopstack-frontend-canary.shopstack.svc.cluster.local
+            subset: v1
+            port:
+              number: 80
+    - route:
+        - destination:
+            host: shopstack-frontend-canary.shopstack.svc.cluster.local
+            subset: v1
+            port:
+              number: 80
+          weight: 90
+        - destination:
+            host: shopstack-frontend-canary.shopstack.svc.cluster.local
+            subset: v2
+            port:
+              number: 80
+          weight: 10

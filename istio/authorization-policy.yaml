@@ -1,0 +1,15 @@
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: productcatalog-frontend-only
+  namespace: shopstack
+spec:
+  selector:
+    matchLabels:
+      app: productcatalogservice
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/shopstack/sa/shopstack-frontend
