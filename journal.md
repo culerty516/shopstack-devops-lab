@@ -3313,3 +3313,2574 @@ This allowed the MacBook Pro to reach the private Kubernetes API through SSH whi
 ---
 
 **Task 3 status: COMPLETE**
+---
+
+# Task 4 — Kubernetes Fundamentals and Helm
+
+**Date completed:** 2026-09-14
+**Working machine:** MacBook Pro (Apple M2, arm64)
+**Primary Kubernetes environment:** Three-node kubeadm cluster on Google Compute Engine
+**Primary Kubernetes version:** v1.37.0
+**Primary container runtime:** containerd 2.2.1
+**Scratch environment:** minikube v1.38.1 using the Docker driver, Kubernetes v1.35.1
+**Application namespace:** `shopstack`
+**Container registry:** `ghcr.io/culerty516/shopstack-frontend`
+**Helm version used for the task:** Helm v3.22.0
+**Podman:** 6.1.1 on the MacBook Pro; 4.9.3 on `k8s-worker-2`
+**Trivy:** 0.74.0
+**Self-hosted deploy runner:** GitHub Actions Runner 2.337.0 on the MacBook Pro, registered as an ephemeral repository runner
+
+The Task 3 kubeadm cluster was reused directly. Because the Kubernetes API is private on the GCP VPC, local `kubectl` access from the MacBook Pro continued to use the SSH tunnel established in Task 3. The kubeadm cluster was the preferred target for the remaining Task 4 work. Minikube was used as a scratch environment for context switching, the metrics-server/HPA exercise, and the explicit minikube ingress-addon requirement.
+
+The primary cluster was:
+
+```text
+k8s-cp        10.10.0.10   control-plane   amd64
+k8s-worker-1  10.10.0.11   worker          amd64
+k8s-worker-2  10.10.0.12   worker          amd64
+```
+
+---
+
+# 7.1 Cluster Bootstrap
+
+## 7.1.1 Verify kubeadm, Start Minikube, and Practice Context Switching
+
+At the start of Task 4, the repository was at the completed Task 3 commit. The kubeadm context was configured to use the locally forwarded API endpoint on `127.0.0.1:6443`.
+
+The initial verification failed:
+
+```bash
+kubectl get nodes -o wide
+kubectl cluster-info
+```
+
+Key error:
+
+```text
+The connection to the server 127.0.0.1:6443 was refused
+```
+
+I checked the local listener and found that the SSH tunnel was no longer running. I recreated the tunnel:
+
+```bash
+ssh -fN \
+  -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:6443:10.10.0.10:6443 \
+  k8s-cp
+```
+
+Verification then succeeded:
+
+```text
+NAME           STATUS   ROLES           VERSION   INTERNAL-IP
+k8s-cp         Ready    control-plane   v1.37.0   10.10.0.10
+k8s-worker-1   Ready    <none>          v1.37.0   10.10.0.11
+k8s-worker-2   Ready    <none>          v1.37.0   10.10.0.12
+```
+
+`kubectl cluster-info` reported the Kubernetes control plane through:
+
+```text
+https://127.0.0.1:6443
+```
+
+I also started the existing minikube scratch cluster with the Docker driver:
+
+```bash
+KUBECONFIG="$HOME/.kube/config" \
+minikube start --driver=docker
+```
+
+The minikube node became `Ready` and reported Kubernetes v1.35.1.
+
+I created a merged Task 4 kubeconfig so both environments could be selected from one file:
+
+```bash
+KUBECONFIG="$HOME/.kube/shopstack-tunnel-config:$HOME/.kube/config" \
+kubectl config view --flatten \
+  > "$HOME/.kube/task4-final-config"
+```
+
+```bash
+chmod 600 "$HOME/.kube/task4-final-config"
+```
+
+```bash
+export KUBECONFIG="$HOME/.kube/task4-final-config"
+```
+
+I listed the merged contexts:
+
+```bash
+kubectl config get-contexts
+```
+
+The available contexts included:
+
+```text
+docker-desktop
+ingress-lab
+kubernetes-admin@kubernetes
+minikube
+```
+
+I practised switching to minikube:
+
+```bash
+kubectl config use-context minikube
+kubectl config current-context
+kubectl get nodes -o wide
+```
+
+and then back to the kubeadm cluster:
+
+```bash
+kubectl config use-context kubernetes-admin@kubernetes
+kubectl config current-context
+kubectl get nodes -o wide
+```
+
+### Cluster targeting for the rest of Task 4
+
+The three-node kubeadm cluster was the primary environment for the Kubernetes application, Online Boutique, Ingress, custom frontend, and Helm deployment. Minikube was intentionally used as the scratch environment for HPA/metrics-server experimentation and for confirming the minikube ingress addon. Online Boutique was initially attempted on minikube, but the final stable deployment was moved to the kubeadm cluster after the Apple Silicon scratch environment showed sustained emulation/resource pressure.
+
+---
+
+## 7.1.2 Explore the Control Plane
+
+I listed the `kube-system` pods and identified the main control-plane components. The kubeadm cluster showed:
+
+```text
+coredns
+etcd
+kube-apiserver
+kube-controller-manager
+kube-proxy
+kube-scheduler
+```
+
+I also confirmed that `kube-proxy` was running as a DaemonSet on all three nodes and CoreDNS was running as a Deployment with two replicas.
+
+On `k8s-cp`, I inspected:
+
+```bash
+sudo ls -lah /etc/kubernetes/manifests
+```
+
+The static-pod manifests were:
+
+```text
+etcd.yaml
+kube-apiserver.yaml
+kube-controller-manager.yaml
+kube-scheduler.yaml
+```
+
+### Core component roles
+
+- **kube-apiserver** is the control-plane entry point. It exposes the Kubernetes API, performs authentication/authorization and admission processing, validates requests, and persists desired state through etcd.
+- **etcd** is the distributed key-value store containing the authoritative cluster state.
+- **kube-scheduler** watches for unscheduled Pods and selects suitable nodes based on resources, constraints, affinity, taints/tolerations, and other scheduling rules.
+- **kube-controller-manager** runs reconciliation controllers that continually move actual cluster state toward declared desired state.
+- **kube-proxy** runs on nodes and implements Service networking rules so ClusterIP/NodePort traffic reaches appropriate endpoints.
+- **CoreDNS** provides Kubernetes service discovery and DNS resolution for Pods and Services.
+
+The static-pod design means the kubelet on the control-plane node watches `/etc/kubernetes/manifests` and directly manages those critical control-plane Pods without requiring a normal Deployment.
+
+---
+
+## 7.1.3 Create and Select the `shopstack` Namespace
+
+I created the namespace declaratively in:
+
+```text
+k8s/namespace.yaml
+```
+
+and applied it:
+
+```bash
+kubectl apply -f k8s/namespace.yaml
+```
+
+I then set it as the default namespace for the current kubeadm context:
+
+```bash
+kubectl config set-context \
+  --current \
+  --namespace=shopstack
+```
+
+Verification returned:
+
+```text
+shopstack
+```
+
+for the current context namespace.
+
+---
+
+# 7.2 First Workload — from Pod to Deployment
+
+## 7.2.1 Imperative Bare Pod
+
+I created the one deliberately imperative bare Pod required by the exercise:
+
+```bash
+kubectl run nginx-pod \
+  --image=nginx:1.27 \
+  --port=80
+```
+
+I waited for readiness and confirmed it was `1/1 Running` on a worker node. I port-forwarded it:
+
+```bash
+kubectl port-forward pod/nginx-pod 8080:80
+```
+
+A separate terminal returned HTTP `200 OK` from nginx.
+
+I then deleted the bare Pod:
+
+```bash
+kubectl delete pod nginx-pod
+```
+
+and confirmed it no longer existed.
+
+### Why controllers are preferred
+
+A bare Pod is an individual runtime object. If the node fails or the Pod is deleted, Kubernetes has no higher-level desired-state object instructing it to recreate the workload. A Deployment/ReplicaSet instead declares a desired replica count and continually reconciles the real state, providing self-healing, scaling, rollout history, rolling updates, and rollback capability. For application workloads I therefore used controllers from this point onward.
+
+---
+
+## 7.2.2 Deployment and ClusterIP Service
+
+I created the git-tracked manifests:
+
+```text
+k8s/frontend-deployment.yaml
+k8s/frontend-service.yaml
+```
+
+The initial Deployment used:
+
+```text
+replicas: 3
+image: nginx:1.27
+```
+
+and the Service used:
+
+```text
+type: ClusterIP
+selector: app=frontend
+port: 80
+```
+
+I applied them and watched the rollout:
+
+```bash
+kubectl apply -f k8s/frontend-deployment.yaml
+```
+
+```bash
+kubectl apply -f k8s/frontend-service.yaml
+```
+
+```bash
+kubectl rollout status deployment/frontend --timeout=120s
+```
+
+The Deployment reached:
+
+```text
+frontend   3/3   3   3
+```
+
+and the three Pods were distributed across `k8s-worker-1` and `k8s-worker-2`.
+
+Port-forwarding the Service also returned the nginx page successfully.
+
+---
+
+## 7.2.3 Rolling Update, Revision History, and Rollback
+
+I inspected the initial revision history:
+
+```bash
+kubectl rollout history deployment/frontend
+```
+
+The initial revision was `1`.
+
+I changed the tracked image from:
+
+```text
+nginx:1.27
+```
+
+to:
+
+```text
+nginx:1.27.5
+```
+
+and re-applied the manifest. The rollout completed successfully and the live Deployment reported `nginx:1.27.5`.
+
+The history then contained revisions `1` and `2`.
+
+I tested rollback:
+
+```bash
+kubectl rollout undo deployment/frontend
+```
+
+After the rollback completed, the live image returned to:
+
+```text
+nginx:1.27
+```
+
+and the revision history advanced again.
+
+`kubectl rollout undo` warned that the resource had previously been managed with `kubectl apply`, and that rollback does not rewrite the `last-applied-configuration` annotation. I therefore also restored the tracked manifest to `nginx:1.27` and re-applied it so declarative source and live state remained aligned.
+
+---
+
+## 7.2.4 Resources, Liveness, Readiness, and a Broken Readiness Probe
+
+I added resource requests and limits:
+
+```yaml
+requests:
+  cpu: 50m
+  memory: 64Mi
+limits:
+  cpu: 200m
+  memory: 128Mi
+```
+
+and HTTP liveness/readiness probes against `/`.
+
+After applying the change, all three Pods became Ready and the Service had three healthy endpoints.
+
+I then deliberately changed only the readiness path to:
+
+```text
+/definitely-not-ready
+```
+
+and re-applied the Deployment.
+
+The new Pod stayed:
+
+```text
+0/1 Running
+```
+
+with no container restart. `kubectl describe pod` showed repeated:
+
+```text
+Readiness probe failed: HTTP probe failed with statuscode: 404
+```
+
+The old three Ready Pods remained Service endpoints while the new Pod appeared in the EndpointSlice with:
+
+```text
+ready: false
+serving: false
+```
+
+The Deployment rollout timed out because the new ReplicaSet could not become Ready.
+
+One command-entry attempt used a literal placeholder:
+
+```text
+kubectl describe pod <NOT_READY_POD_NAME>
+```
+
+which produced a zsh parse error. I corrected this by using the actual Pod name.
+
+I restored the readiness path to `/`, re-applied the Deployment, and the rollout completed. The Service once again contained only Ready endpoints.
+
+### Why the Pod did not restart
+
+Readiness controls whether a Pod is eligible to receive Service traffic. A failed readiness probe marks the container NotReady but does not kill it. Liveness answers a different question: whether the process is still healthy enough to continue running. Repeated liveness failure causes kubelet to restart the container.
+
+---
+
+## 7.2.5 Scaling and HPA
+
+I first scaled the Deployment declaratively from three to five replicas and verified:
+
+```text
+frontend   5/5
+```
+
+For the HPA requirement, I switched to the minikube scratch cluster and enabled the metrics-server addon:
+
+```bash
+minikube addons enable metrics-server
+```
+
+I confirmed the Metrics API became usable with `kubectl top` and deployed the same frontend workload there.
+
+The HPA manifest was stored in:
+
+```text
+k8s/frontend-hpa.yaml
+```
+
+using `autoscaling/v2`, with:
+
+```text
+minReplicas: 5
+maxReplicas: 10
+CPU target: 50%
+```
+
+### Initial load attempt and metrics-server pressure
+
+My first HTTP load-generator approach pushed the small minikube environment hard enough that metrics-server itself became unhealthy. HPA events included failures such as:
+
+```text
+failed to get cpu utilization
+unable to fetch metrics from resource metrics API
+```
+
+This made the first load method unsuitable for demonstrating HPA behaviour reliably.
+
+After the environment recovered, I used a controlled CPU load inside one existing frontend Pod rather than adding multiple aggressive load-generator Pods.
+
+The loaded frontend Pod reached approximately:
+
+```text
+184m CPU
+```
+
+The HPA then showed:
+
+```text
+cpu: 81%/50%
+replicas: 8
+```
+
+and the Deployment became:
+
+```text
+8/8
+```
+
+`kubectl describe hpa frontend` recorded:
+
+```text
+SuccessfulRescale  New size: 8; reason: cpu resource utilization (percentage of request) above target
+```
+
+I stopped the temporary CPU load after proving the rescale.
+
+This exercise demonstrated both the HPA dependency on resource metrics and the importance of not starving the very telemetry components used for autoscaling decisions.
+
+---
+
+# 7.3 Configuration and Secrets
+
+## 7.3.1 ConfigMap Mounted into the Frontend
+
+I created:
+
+```text
+k8s/frontend-configmap.yaml
+```
+
+with an `index.html` containing:
+
+```text
+Feature flag: VERSION_A
+```
+
+### Initial mounting mistake
+
+I applied the ConfigMap and Deployment, but the response still showed the default nginx page. Inspection of the tracked Deployment showed that the expected `volumeMounts` and `volumes` blocks were absent.
+
+The ConfigMap itself was correct; the Deployment simply was not consuming it.
+
+I corrected the Deployment to mount the ConfigMap at:
+
+```text
+/usr/share/nginx/html
+```
+
+After re-applying and completing the rollout, the page returned:
+
+```text
+ShopStack Frontend
+Feature flag: VERSION_A
+```
+
+### ConfigMap update without a Deployment rollout
+
+In another Terminal, `KUBECONFIG` was initially empty and `kubectl` was still using the minikube context. A lookup for the kubeadm frontend therefore returned `NotFound`.
+
+I corrected the terminal session with:
+
+```bash
+export KUBECONFIG="$HOME/.kube/task4-final-config"
+```
+
+and selected:
+
+```text
+kubernetes-admin@kubernetes
+```
+
+Before changing the ConfigMap, the Deployment reported the same generation/revision and I recorded the existing Pod names.
+
+I then changed:
+
+```text
+VERSION_A
+```
+
+to:
+
+```text
+VERSION_B
+```
+
+and applied only the ConfigMap.
+
+The Deployment generation/revision stayed unchanged and the Pod names remained unchanged. After the projected ConfigMap volume updated, the same Pods served:
+
+```text
+Feature flag: VERSION_B
+```
+
+This showed that updating a mounted ConfigMap does not itself change the Deployment Pod template and therefore does not cause a rollout. Kubernetes updates projected ConfigMap volume contents asynchronously on existing Pods.
+
+---
+
+## 7.3.2 Secret Consumption
+
+I created the lab-only Secret manifest:
+
+```text
+k8s/frontend-secret.yaml
+```
+
+with the keys:
+
+```text
+db-user
+db-password
+```
+
+The values were deliberately non-production demonstration credentials. `kubectl describe secret` showed the key sizes without printing their contents.
+
+I updated the frontend Deployment to consume them through `secretKeyRef` as:
+
+```text
+DB_USER
+DB_PASSWORD
+```
+
+### Base64 is not encryption
+
+The Kubernetes Secret API commonly represents values using base64. Base64 only converts arbitrary bytes to a text-safe representation. Anyone who can read the Secret object can decode it; base64 provides no confidentiality by itself.
+
+Production-grade alternatives include:
+
+- **External Secrets Operator** backed by a provider such as Google Secret Manager, AWS Secrets Manager, or another managed secret store/KMS.
+- **Sealed Secrets**, where an encrypted SealedSecret can safely be stored in Git and only the in-cluster controller can decrypt it.
+
+In production I would also combine secret management with least-privilege RBAC and Kubernetes/etcd encryption at rest where applicable. Real credentials should not be committed in plaintext to a public repository.
+
+---
+
+# 7.4 Deploy the Full Demo Application
+
+## 7.4.1 Online Boutique
+
+I downloaded the Online Boutique v0.10.6 release manifest into:
+
+```text
+k8s/online-boutique.yaml
+```
+
+The tracked upstream manifest was 980 lines and referenced the v0.10.6 microservice images.
+
+### First attempt on Apple Silicon minikube
+
+I initially deployed the application into `shopstack` on minikube. Some of the v0.10.6 images inspected during this run were `linux/amd64`. Running those workloads on the Apple M2 minikube environment therefore involved emulation.
+
+The existing minikube profile was also resource-constrained. During the rollout:
+
+```text
+CPU utilisation exceeded 200% of the Docker-host allocation
+multiple liveness/readiness probes timed out
+several services entered repeated restarts / CrashLoopBackOff
+```
+
+The events showed probe timeouts across several services, including cart, recommendation, currency, ad, and frontend.
+
+I tried non-destructive resource troubleshooting. Starting the existing profile with a larger `--cpus` value produced:
+
+```text
+You cannot change the CPUs for an existing minikube cluster. Please first delete the cluster.
+```
+
+I deliberately did not delete/reset the cluster. I also tested increased Docker CPU quota and limited temporary CPU-limit adjustments while diagnosing the bottleneck.
+
+The workload remained unreliable under this M2 emulation/resource combination, and the MacBook became noticeably saturated.
+
+### Final deployment on native x86_64 kubeadm
+
+Because the task explicitly prefers the kubeadm cluster, I stopped using minikube for the final Online Boutique runtime, restored the tracked release manifest to the clean upstream v0.10.6 form, switched back to `kubernetes-admin@kubernetes`, and applied it to the GCP kubeadm cluster.
+
+On the native AMD64 workers, all twelve Online Boutique Deployments converged successfully to their desired `1/1` Ready state. The email and recommendation services had a small number of startup probe restarts while the stack was converging, but they remained stable afterward.
+
+The important conclusion was not that Online Boutique universally lacks ARM support; rather, the exact v0.10.6 image/platform combination and resource limits observed in this run made the M2 minikube environment significantly less stable than the native x86_64 kubeadm workers.
+
+---
+
+## 7.4.2 Ingress at `shopstack.local`
+
+For the primary kubeadm cluster, I installed ingress-nginx using the upstream bare-metal manifest. The controller became:
+
+```text
+1/1 Running
+```
+
+on `k8s-worker-2`, and the controller Service exposed NodePorts for HTTP/HTTPS.
+
+I created:
+
+```text
+k8s/online-boutique-ingress.yaml
+```
+
+with:
+
+```text
+host: shopstack.local
+path: /
+backend: frontend:80
+ingressClassName: nginx
+```
+
+I mapped:
+
+```text
+127.0.0.1 shopstack.local
+```
+
+in the MacBook Pro `/etc/hosts` file.
+
+The GCP nodes only exposed private cluster addresses to this lab workflow, so I used a local port-forward to the ingress-nginx controller:
+
+```bash
+kubectl port-forward \
+  -n ingress-nginx \
+  service/ingress-nginx-controller \
+  8080:80
+```
+
+Then:
+
+```bash
+curl -I http://shopstack.local:8080/
+```
+
+returned HTTP `200`.
+
+A browser test also displayed Online Boutique.
+
+### Browser HTTPS mistake
+
+Chrome initially produced:
+
+```text
+ERR_SSL_PROTOCOL_ERROR
+```
+
+because it attempted HTTPS against the plain-HTTP local port-forward. Using the explicit URL:
+
+```text
+http://shopstack.local:8080/
+```
+
+fixed the browser test.
+
+One later ingress port-forward session also reported:
+
+```text
+error: lost connection to pod
+```
+
+I restarted the same port-forward and it worked normally afterward.
+
+### Explicit minikube ingress-addon requirement
+
+Although the final application was on kubeadm, I separately started minikube and ran:
+
+```bash
+minikube addons enable ingress
+```
+
+`minikube addons list` showed:
+
+```text
+ingress   enabled
+```
+
+and the minikube ingress-nginx controller was `1/1 Running`. I then stopped minikube and returned to the kubeadm context.
+
+---
+
+## 7.4.3 Troubleshooting Drill — Broken Service Selector
+
+I deliberately broke the Online Boutique frontend Service selector from:
+
+```text
+app=frontend
+```
+
+to:
+
+```text
+app=frontend-broken
+```
+
+The Service itself still existed, but:
+
+```bash
+kubectl get endpoints frontend
+```
+
+returned:
+
+```text
+<none>
+```
+
+and the EndpointSlice had no usable endpoint.
+
+I diagnosed the failure using the required tools.
+
+### `kubectl get` / `describe`
+
+`kubectl describe service frontend` showed:
+
+```text
+Selector: app=frontend-broken
+Endpoints:
+```
+
+while the frontend Pod had:
+
+```text
+app=frontend
+```
+
+### `kubectl logs`
+
+The frontend application logs continued to show successful HTTP requests and successful `/_healthz` readiness requests. This established that the application process itself was healthy.
+
+### `kubectl debug` / ephemeral containers
+
+I attached a BusyBox ephemeral debug container to the frontend Pod and tested its local health endpoint. The debug container returned:
+
+```text
+ok
+```
+
+I then used another ephemeral container to call the Service DNS name. It resolved the Service ClusterIP but failed to connect:
+
+```text
+Connecting to frontend (10.106.92.186:80)
+wget: can't connect to remote host ... Connection refused
+```
+
+### Root cause and fix
+
+The application Pod was healthy, but the Service selector no longer matched the Pod label, so Kubernetes had no endpoints behind the Service.
+
+I repaired the Service declaratively by re-applying the tracked Online Boutique manifest. The selector returned to:
+
+```text
+app=frontend
+```
+
+and the endpoint was restored on port `8080`.
+
+This drill demonstrated why I should follow the path layer by layer: workload health, labels, Service selector, endpoints, and only then external routing.
+
+---
+
+# 7.5 Build a Container Image from Git — Podman and Docker
+
+## 7.5.1 Write the Application and Commit It
+
+I created:
+
+```text
+frontend-src/app.py
+frontend-src/requirements.txt
+```
+
+The Python Flask application has two endpoints:
+
+```text
+GET /         -> HTML greeting plus version string
+GET /healthz  -> HTTP 200 with "ok"
+```
+
+Dependencies were pinned:
+
+```text
+Flask==3.1.2
+gunicorn==23.0.0
+```
+
+I tested the app locally in a temporary Python virtual environment with Gunicorn. The root page reported version `0.1.0` and `/healthz` returned HTTP `200`.
+
+During the Task 4 audit I noticed that the source had been created before the required meaningful git commit was made. I reconstructed the actual `0.1.0` source state before the visible version bump and committed it as:
+
+```text
+046aac3 Add containerized ShopStack frontend v0.1.0
+```
+
+The later visible release change was committed separately as:
+
+```text
+65ccfd1 Release ShopStack frontend v0.2.0
+```
+
+This preserved a genuine versioned Git history rather than collapsing both states into one final commit.
+
+---
+
+## 7.5.2 Dockerfile, Non-root Runtime, and Image Size
+
+The first container attempt used a pinned slim Python base. Functionally it worked and already ran as UID/GID `10001`, but the Podman image was approximately:
+
+```text
+158 MB
+```
+
+which was slightly above the task's approximate 150 MB target.
+
+`podman history` showed the base image was the dominant layer, so I optimized the final Dockerfile to use the pinned base:
+
+```dockerfile
+FROM python:3.13-alpine3.22
+```
+
+The final image:
+
+- uses a pinned base tag rather than `latest`;
+- creates a dedicated `shopstack` account with UID/GID `10001`;
+- runs with `USER 10001:10001`;
+- uses Gunicorn on port `8080`;
+- installs only the pinned application requirements;
+- includes a `.dockerignore` to exclude local artifacts.
+
+The Podman image dropped to approximately:
+
+```text
+57.6 MB
+```
+
+which was comfortably below the target.
+
+The task allows either a multi-stage build or at minimum a slim/distroless-style base. This implementation uses a small Alpine runtime rather than a multi-stage build.
+
+---
+
+## 7.5.3 Podman as the Primary Tool
+
+Podman was not initially installed on the MacBook Pro:
+
+```text
+zsh: command not found: podman
+```
+
+I installed Podman 6.1.1 with Homebrew. Because macOS does not provide a native Linux kernel for Linux containers, Podman uses a lightweight Linux Podman Machine. I initialized and started a rootless ARM64 Podman Machine with 2 CPUs, 2 GiB memory, and a 20 GiB disk.
+
+The final semantic local image tag was:
+
+```text
+shopstack-frontend:0.1.0
+```
+
+I built and ran it with Podman, verified the root page, verified `/healthz`, and confirmed inside the container:
+
+```text
+uid=10001(shopstack) gid=10001(shopstack)
+```
+
+I also used:
+
+```text
+podman images
+podman inspect
+podman history
+```
+
+The optimized ARM64 image reported approximately `57.6 MB`.
+
+For comparison during optimization I retained evidence of:
+
+```text
+0.1.0-slim    ~158 MB
+0.1.0-alpine  ~57.6 MB
+```
+
+### Podman architecture compared with Docker
+
+Podman is daemonless: normal CLI operations do not depend on one long-running privileged central daemon equivalent to `dockerd`. The Podman CLI and libraries create the necessary container processes through a fork/exec model and an OCI runtime such as `crun`/`runc`.
+
+Podman also supports rootless operation as a first-class mode. Reducing the privileges of the container-management process limits the impact of a container-engine compromise.
+
+Its process-oriented model integrates naturally with systemd. A Podman container can be represented by a systemd user unit, which is exactly what I later demonstrated on `k8s-worker-2` with `podman generate systemd --new`.
+
+On macOS, the Podman CLI still requires the Podman Machine Linux VM because the containers themselves need a Linux kernel; that does not change the daemonless/rootless model inside the Linux container host.
+
+---
+
+## 7.5.4 Build the Same Dockerfile with Docker and Scan It
+
+I built the same final Dockerfile with Docker Desktop.
+
+Docker inspection showed:
+
+```text
+Architecture: arm64
+OS: linux
+User: 10001:10001
+Image ID: sha256:0e465d970c8174c1cd671b55d481aa2288adec372e90f1140e31d61cdc0f8998
+```
+
+Docker's inspect content size was approximately:
+
+```text
+19.3 MB
+```
+
+while Docker Desktop's local disk accounting displayed a larger disk-use figure.
+
+The equivalent final Podman Alpine build reported:
+
+```text
+Podman image ID:
+33d5178de1f31b51f59c4a2e9cb342950afdb638cce39cc6a39fe05a5f8d04b5
+
+Podman size:
+57.6 MB
+57640187 bytes
+```
+
+The Docker and Podman image IDs were therefore different even though both were built from the same Dockerfile.
+
+These values do not have to match byte-for-byte even with the same Dockerfile. Different builders can emit different creation metadata, timestamps, manifests, provenance, and storage bookkeeping. The important OCI compatibility result was that the same Dockerfile built and ran correctly with both engines, with the same application behaviour and non-root UID.
+
+### Trivy findings
+
+I installed Trivy 0.74.0 and scanned:
+
+```bash
+trivy image \
+  --severity HIGH,CRITICAL \
+  --ignore-unfixed \
+  --format table \
+  shopstack-frontend:0.1.0
+```
+
+Trivy detected Alpine 3.22.4. The scan recorded:
+
+```text
+HIGH:     10
+CRITICAL: 0
+```
+
+The Python-package section did not report vulnerabilities in this scan. The OS findings included OpenSSL packages (`libcrypto3`/`libssl3`) and util-linux/libuuid-related findings, with fixed versions shown for the relevant entries because `--ignore-unfixed` was used.
+
+The later CI security gate intentionally fails only on `CRITICAL` vulnerabilities, so this image passed that gate while still leaving the HIGH findings visible for normal remediation planning.
+
+---
+
+## 7.5.5 Push to GHCR
+
+At this stage the local repository did not yet have a GitHub remote. I authenticated GitHub CLI as:
+
+```text
+culerty516
+```
+
+For the initial Podman package push I used a separate scoped GHCR access token entered through a hidden shell variable and piped to:
+
+```text
+podman login ghcr.io --password-stdin
+```
+
+The token itself was not printed or committed.
+
+Because the kubeadm worker nodes are AMD64, I built an AMD64 image with Podman and pushed:
+
+```text
+ghcr.io/culerty516/shopstack-frontend:0.1.0
+```
+
+The pushed image was initially a **single-platform OCI image**, not a multi-architecture index. Therefore:
+
+```text
+podman manifest inspect ...
+```
+
+returned an error explaining that treating a single image as a manifest list was not implemented. This was not a failed push; the multi-architecture index was intentionally created later in Task 7.6.
+
+An anonymous remote inspection initially received `401 Unauthorized` because the GHCR package was private. I changed the package visibility to public. After that, I logged Docker out of GHCR and successfully pulled the package anonymously, proving the cluster could also pull it without an imagePullSecret.
+
+---
+
+## 7.5.6 Deploy My Own Image and Release `0.2.0`
+
+I created:
+
+```text
+k8s/frontend-own-deployment.yaml
+```
+
+The Deployment uses:
+
+```text
+image: ghcr.io/culerty516/shopstack-frontend:0.1.0
+replicas: 3
+containerPort: 8080
+readiness: /healthz
+liveness: /healthz
+runAsNonRoot: true
+runAsUser: 10001
+runAsGroup: 10001
+```
+
+I replaced the Online Boutique frontend workload with my own image while keeping the `frontend` Service/Ingress path. The rollout reached three Ready Pods and the ingress response showed:
+
+```text
+Version: 0.1.0
+```
+
+with `/healthz` returning HTTP `200`.
+
+I then made the required visible application change. Version `0.2.0` added:
+
+```text
+Release: Kubernetes-ready frontend
+```
+
+I rebuilt the AMD64 image with Podman, pushed:
+
+```text
+ghcr.io/culerty516/shopstack-frontend:0.2.0
+```
+
+and updated the tracked Deployment to version `0.2.0`.
+
+The rollout completed successfully and all three Pods were Ready. The ingress response showed:
+
+```text
+Version: 0.2.0
+Release: Kubernetes-ready frontend
+```
+
+and `/healthz` still returned HTTP `200`.
+
+These `0.1.0` and `0.2.0` application states are the pair intended for the later Istio canary exercise.
+
+---
+
+## 7.5.7 Tagging Discipline
+
+I do not deploy mutable `latest` tags for this lab.
+
+`latest` is an anti-pattern because the same tag can point at different image content over time. A Deployment manifest that says only `image: app:latest` therefore does not provide a durable mapping from source/release to artifact. Rollback becomes ambiguous because an older Kubernetes ReplicaSet may still refer to the same mutable tag while the registry now serves different bytes.
+
+`imagePullPolicy` adds another source of confusion. If the pull policy is omitted when an object is first created, Kubernetes commonly defaults `latest` to `Always` and a non-`latest` tag to `IfNotPresent`. The stored `imagePullPolicy` field does not automatically change merely because the image tag is edited later. Relying on implicit tag/pull behaviour is therefore fragile.
+
+My convention is:
+
+```text
+semver tags for human releases: 0.1.0, 0.2.0
+immutable full Git SHA tags for CI builds
+```
+
+This makes build provenance and rollback targets explicit.
+
+---
+
+## 7.5.8 Rootless Podman with a systemd User Unit on a VM
+
+The original task names a Proxmox VM. The Final Run uses the documented GCP cloud-VM substitution from Tasks 2–3, so I used the existing Ubuntu 24.04 AMD64 worker `k8s-worker-2`. This preserves the learning objective: run the registry image rootlessly on a normal Linux host outside Kubernetes and manage it with a systemd user service.
+
+I installed Podman from Ubuntu packages on `k8s-worker-2` and verified:
+
+```text
+podman version 4.9.3
+rootless=true
+arch=amd64
+```
+
+The normal `ubuntu` user also had subordinate UID/GID ranges in `/etc/subuid` and `/etc/subgid`.
+
+One first `podman info --format` expression attempted to access a field not exposed by this Podman version and returned a Go-template field error. I reran the command using only the supported `Rootless` and `Arch` fields.
+
+I pulled the public image:
+
+```text
+ghcr.io/culerty516/shopstack-frontend:0.2.0
+```
+
+and ran it rootlessly bound only to:
+
+```text
+127.0.0.1:18080 -> container 8080
+```
+
+The root page and `/healthz` both worked, and:
+
+```bash
+podman exec shopstack-frontend id
+```
+
+showed:
+
+```text
+uid=10001(shopstack) gid=10001(shopstack)
+```
+
+I generated the required systemd user unit with:
+
+```bash
+podman generate systemd \
+  --new \
+  --name \
+  shopstack-frontend \
+  > ~/.config/systemd/user/container-shopstack-frontend.service
+```
+
+Podman 4.9.3 printed a deprecation notice recommending Quadlets for new deployments. I retained `podman generate systemd --new` here because the practice task explicitly requires demonstrating that command.
+
+I stopped/removed the manually started container, reloaded the user manager, and enabled the generated service. `systemctl --user status` reported:
+
+```text
+Active: active (running)
+```
+
+under the user's systemd slice.
+
+I enabled user lingering with `loginctl` so the user service could stay active independently of an interactive SSH login. After logging out and reconnecting, the service was still active and the page still returned version `0.2.0`.
+
+Installing Podman on the Kubernetes worker did not replace or reconfigure the Kubernetes CRI. kubelet continued using containerd; Podman was a separate user-space container tool for this host exercise.
+
+---
+
+# 7.6 CI/CD — Multi-Architecture Images with GitHub Actions
+
+## 7.6.1 Repository and Workflow
+
+I created the public GitHub repository:
+
+```text
+culerty516/shopstack-devops-lab
+```
+
+and added it as `origin`.
+
+The CI workflow is:
+
+```text
+.github/workflows/build-image.yaml
+```
+
+It is triggered by:
+
+```text
+push to main
+push of tags matching v*
+workflow_dispatch
+```
+
+The initial workflow was committed as:
+
+```text
+1618be3 Add multi-arch container CI pipeline
+```
+
+---
+
+## 7.6.2 Multi-arch Build and GHCR Push
+
+The workflow performs the required build path:
+
+```text
+actions/checkout@v4
+docker/setup-qemu-action@v3
+docker/setup-buildx-action@v3
+GHCR login with the built-in GITHUB_TOKEN
+docker buildx build --platform linux/amd64,linux/arm64 --push
+```
+
+It pushes the image with the immutable full Git SHA. When the Git ref is a version tag such as `v0.2.0`, it additionally strips the leading `v` and pushes the semantic version tag `0.2.0`.
+
+The workflow does not store a long-lived personal registry token for normal CI image publication; it uses the repository-scoped built-in `GITHUB_TOKEN` with `packages: write` permission.
+
+---
+
+## 7.6.3 Verify the Manifest List and Run ARM64
+
+The first green `main` CI image used Git SHA:
+
+```text
+1618be311e79937b3befe47c94f6efdf2a7a692f
+```
+
+I inspected it with:
+
+```bash
+docker buildx imagetools inspect \
+  ghcr.io/culerty516/shopstack-frontend:1618be311e79937b3befe47c94f6efdf2a7a692f
+```
+
+The OCI index contained:
+
+```text
+linux/amd64
+linux/arm64
+```
+
+plus `unknown/unknown` attestation manifests generated by the build tooling.
+
+The index digest was:
+
+```text
+sha256:e20c0bebd149d5cda992cf70e72a313c25393ffa0664e7a015e04a469daf9168
+```
+
+I then explicitly pulled the ARM64 platform on the Apple M2 MacBook Pro and inspected it as:
+
+```text
+ARCH=arm64 OS=linux USER=10001:10001
+```
+
+I ran that ARM64 image locally. The page returned version `0.2.0`, `/healthz` returned HTTP `200`, and the container ran as UID/GID `10001`.
+
+This demonstrated that the same registry tag could resolve to the appropriate platform-specific manifest on an ARM64 machine.
+
+---
+
+## 7.6.4 Manual Trigger and Trivy CRITICAL Gate
+
+The workflow includes:
+
+```yaml
+workflow_dispatch:
+```
+
+for manual execution.
+
+A separate scan job runs Trivy 0.74.0 against both:
+
+```text
+linux/amd64
+linux/arm64
+```
+
+with:
+
+```text
+--exit-code 1
+--severity CRITICAL
+```
+
+Therefore a CRITICAL vulnerability on either platform fails the workflow.
+
+The verified runs completed the scan job successfully with no CRITICAL findings.
+
+---
+
+## 7.6.5 Green Runs, Build Time, and Buildx Cache
+
+The first green push run was:
+
+```text
+Run ID: 34775919450
+Branch: main
+Result: success
+```
+
+Its measured multi-architecture build step took:
+
+```text
+38 seconds
+```
+
+The workflow originally included `cache-from` and `cache-to` settings for the GitHub Actions cache, but a log inspection did not show actual BuildKit cache import/hits.
+
+I corrected the inline Buildx environment by adding the GitHub Actions runtime exposure step and committed the cache fix as:
+
+```text
+72b17ba Enable GitHub Actions Buildx cache
+```
+
+After one run populated the cache, I triggered the workflow manually. The cached run was:
+
+```text
+Run ID: 34776876099
+Event: workflow_dispatch
+Result: success
+```
+
+Its build logs showed:
+
+```text
+importing cache manifest from gha:...
+CACHED
+CACHED
+...
+```
+
+across the Dockerfile steps, and the measured multi-architecture build time dropped to:
+
+```text
+6 seconds
+```
+
+This demonstrates the purpose of `cache-from`/`cache-to`: BuildKit can reuse unchanged layers from a previous workflow execution rather than rebuilding them on every clean GitHub-hosted runner.
+
+A version tag was also tested. I created/pushed `v0.2.0`, which triggered a green tag run and published `ghcr.io/culerty516/shopstack-frontend:0.2.0` as a proper multi-architecture OCI index containing both AMD64 and ARM64 manifests.
+
+## 7.6.6 Stretch Goal — Automated Deploy Stage
+
+I extended the workflow so a successful push to `main` continues from image build and Trivy scanning into a Helm deployment against the kubeadm cluster.
+
+The deploy job is ordered after both previous jobs:
+
+```text
+build -> scan -> deploy
+```
+
+and is limited to pushes to `main`:
+
+```yaml
+if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+```
+
+The deployment uses a repository-level self-hosted runner on the MacBook Pro with the custom label:
+
+```text
+task4-deploy
+```
+
+I used GitHub Actions Runner `2.337.0` and registered it with `--ephemeral`, so it accepts one job and then automatically removes its runner credentials/registration. This avoided leaving a permanently available general-purpose runner attached to the public repository.
+
+The deploy job performs the following path:
+
+```text
+checkout repository
+-> configure Homebrew kubectl/Helm paths
+-> reuse/start the local kubeadm SSH API tunnel
+-> helm upgrade --install with image.tag=<full Git SHA>
+-> wait for the Deployment rollout
+-> verify the live Deployment image equals the expected SHA image
+-> port-forward the Service
+-> verify the application page contains the Git SHA
+-> verify /healthz returns ok
+```
+
+The Helm command uses an immutable image tag rather than `latest`:
+
+```bash
+helm upgrade --install shopstack-frontend \
+  charts/frontend-chart \
+  --namespace shopstack \
+  --kube-context kubernetes-admin@kubernetes \
+  --set image.repository="${IMAGE_REPOSITORY}" \
+  --set-string image.tag="${GITHUB_SHA}" \
+  --wait \
+  --timeout 5m
+```
+
+### First deploy run: failed on macOS shell compatibility
+
+The first deployment-enabled workflow run was:
+
+```text
+Run ID: 34820950439
+Commit: ad669e3 Add automated Helm deployment stage
+```
+
+The build and scan jobs both passed, and the self-hosted runner successfully reached the kubeadm API. All three nodes were reported `Ready`. The deploy job then failed before `helm upgrade` executed with:
+
+```text
+bad substitution
+```
+
+The failing expression was:
+
+```bash
+${GITHUB_REPOSITORY_OWNER,,}
+```
+
+That Bash 4+ lowercase expansion had worked on the GitHub-hosted Ubuntu build runner, but the macOS self-hosted runner executed workflow shell steps with Apple's `/bin/bash`, which does not support that syntax.
+
+I changed only the failing portability point, replacing the Bash-specific expansion with:
+
+```bash
+IMAGE_OWNER="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+```
+
+I verified the replacement directly with macOS `/bin/bash`, then committed the fix as:
+
+```text
+17ea244 Fix macOS deploy runner shell compatibility
+```
+
+Because the first runner was ephemeral, it had already consumed its single job and deregistered even though that job failed. I registered a new ephemeral runner for the retry.
+
+### Successful end-to-end deployment
+
+The corrected workflow run was:
+
+```text
+Run ID: 34822419994
+Commit SHA: 17ea2441328d1945fd0d10b5a4c3adb7691382fe
+Result: success
+```
+
+All three jobs were green:
+
+```text
+Build and push multi-arch image       18s   success
+Trivy CRITICAL vulnerability gate     26s   success
+Deploy SHA image to kubeadm          1m18s  success
+```
+
+The deploy job upgraded the existing Helm release:
+
+```text
+Release: shopstack-frontend
+Namespace: shopstack
+Status: deployed
+Revision: 2
+```
+
+The rollout verification compared the expected and live images and they matched exactly:
+
+```text
+Expected: ghcr.io/culerty516/shopstack-frontend:17ea2441328d1945fd0d10b5a4c3adb7691382fe
+Deployed: ghcr.io/culerty516/shopstack-frontend:17ea2441328d1945fd0d10b5a4c3adb7691382fe
+```
+
+The CI application check returned the new immutable version from the page:
+
+```text
+Version: 17ea2441328d1945fd0d10b5a4c3adb7691382fe
+Release: Kubernetes-ready frontend
+```
+
+and `/healthz` returned:
+
+```text
+ok
+```
+
+Post-run cluster verification showed Helm history:
+
+```text
+REVISION  STATUS      DESCRIPTION
+1         superseded  Install complete
+2         deployed    Upgrade complete
+```
+
+and three frontend Pods were `1/1 Running` across `k8s-worker-1` and `k8s-worker-2`.
+
+The ephemeral runner then printed:
+
+```text
+Job Deploy SHA image to kubeadm completed with result: Succeeded
+Removed .credentials
+Removed .runner
+```
+
+A subsequent repository-runner API query returned no runner entries, confirming that the temporary runner deregistered cleanly.
+
+### Cluster credentials and GitOps security discussion
+
+For this lab I deliberately did **not** upload the kubeconfig or the ShopStack SSH private key to GitHub Secrets. The self-hosted runner used the MacBook Pro's existing local kubeconfig:
+
+```text
+~/.kube/task4-final-config
+```
+
+and the existing SSH configuration/tunnel to reach the private kubeadm API.
+
+This avoids storing long-lived cluster credentials in the hosted CI service, but it does not remove the trust problem: workflow code running on a self-hosted runner can potentially access credentials and files available to the runner account. This is especially important for a public repository. I reduced that exposure in this lab by using a repository-scoped runner, a specific deploy label, and an **ephemeral** one-job registration rather than leaving a permanent runner online.
+
+For production, a pull-based GitOps model such as **Argo CD** or **Flux** is preferable where practical. CI can build, scan, and publish the immutable image and update desired state in Git, while an in-cluster controller pulls and reconciles that state. This keeps direct cluster credentials out of the hosted CI path and gives the cluster-side controller an auditable reconciliation model.
+
+The Node.js 20 deprecation annotations shown by GitHub Actions were warnings from third-party/action runtime compatibility; they did not cause the successful run to fail.
+
+---
+
+# 7.7 Package Management with Helm
+
+## 7.7.1 Helm 3 and Helm 2 Comparison
+
+The MacBook Pro initially had Helm 4.3.0 on PATH. Because the practice task explicitly requires Helm 3, I installed the Homebrew `helm@3` keg and placed it first in PATH.
+
+Verification returned:
+
+```text
+/opt/homebrew/opt/helm@3/bin/helm
+Helm v3.22.0
+```
+
+I left Helm 4 installed but used Helm 3 for this task.
+
+### Helm 3 vs Helm 2
+
+Helm 2 depended on the in-cluster **Tiller** server component, which performed privileged release operations on behalf of Helm clients. This created a significant operational and security surface, particularly when Tiller had broad cluster permissions.
+
+Helm 3 is client-only from the user's perspective and communicates directly with the Kubernetes API using the caller's kubeconfig/RBAC identity. There is no Tiller server.
+
+By default, Helm 3 stores release records in Kubernetes **Secrets** in the target namespace. These records include rendered release information and historical revisions used for operations such as `helm history` and rollback.
+
+---
+
+## 7.7.2 Bitnami Repository, `--set`, Values File, and Precedence
+
+I added/used the Bitnami repository and searched for nginx. The chart used in this exercise was:
+
+```text
+bitnami/nginx
+chart version: 25.1.11
+app version: 1.31.5
+```
+
+I installed it into a new namespace with the custom release name:
+
+```text
+shopstack-nginx-lab
+```
+
+and initially overrode:
+
+```text
+replicaCount=2
+```
+
+using `--set`.
+
+The release became revision `1` and the Deployment reached `2/2`.
+
+Bitnami emitted warnings that this chart version used rolling `latest` image tags in its current public catalog configuration and recommended explicit production resource settings. I treated that as a useful example of why chart defaults must be reviewed rather than trusted blindly.
+
+I then created:
+
+```text
+charts/helm-lab-values.yaml
+```
+
+with:
+
+```yaml
+replicaCount: 3
+service:
+  type: ClusterIP
+```
+
+I upgraded the same release with the values file and pinned chart version `25.1.11`. Revision `2` reached `3/3` and the Service changed to `ClusterIP`.
+
+### Value precedence
+
+For the parts used in this task, Helm applies values roughly from lower to higher precedence as:
+
+```text
+chart defaults
+< values files supplied with -f/--values (later files override earlier files)
+< command-line overrides such as --set / --set-string
+```
+
+This lets a reusable chart provide safe defaults while environment/release-specific files and explicit CI overrides replace only the values that need to differ.
+
+---
+
+## 7.7.3 Upgrade, History, Rollback, List, and Status
+
+After the values-file upgrade, `helm history` showed:
+
+```text
+1  superseded  Install complete
+2  deployed    Upgrade complete
+```
+
+I rolled the release back to revision `1`:
+
+```bash
+helm rollback \
+  shopstack-nginx-lab \
+  1 \
+  --namespace helm-lab
+```
+
+The rollback succeeded. The Deployment returned to two replicas and the Service returned to the revision-1 `LoadBalancer` configuration.
+
+`helm history` then showed a new revision:
+
+```text
+1  superseded  Install complete
+2  superseded  Upgrade complete
+3  deployed    Rollback to 1
+```
+
+I listed releases across all namespaces:
+
+```bash
+helm list -A
+```
+
+Key result:
+
+```text
+NAME                 NAMESPACE  REVISION  UPDATED                               STATUS    CHART          APP VERSION
+shopstack-nginx-lab  helm-lab   3         2026-09-14 03:23:23.973638 +0800 HKT  deployed  nginx-25.1.11  1.31.5
+```
+
+I then inspected the release directly:
+
+```bash
+helm status \
+  shopstack-nginx-lab \
+  -n helm-lab
+```
+
+Key result:
+
+```text
+NAME: shopstack-nginx-lab
+LAST DEPLOYED: Mon Sep 14 03:23:23 2026
+NAMESPACE: helm-lab
+STATUS: deployed
+REVISION: 3
+TEST SUITE: None
+CHART NAME: nginx
+CHART VERSION: 25.1.11
+APP VERSION: 1.31.5
+```
+
+For the repository deliverable, I also saved the live Helm revision history under `charts/`:
+
+```bash
+helm history shopstack-nginx-lab \
+  -n helm-lab \
+  > charts/helm-history-evidence.txt
+```
+
+The evidence file contains:
+
+```text
+REVISION  UPDATED                   STATUS      CHART          APP VERSION  DESCRIPTION
+1         Mon Sep 14 03:18:33 2026  superseded  nginx-25.1.11  1.31.5       Install complete
+2         Mon Sep 14 03:21:04 2026  superseded  nginx-25.1.11  1.31.5       Upgrade complete
+3         Mon Sep 14 03:23:23 2026  deployed    nginx-25.1.11  1.31.5       Rollback to 1
+```
+
+This demonstrates that Helm rollback creates another release revision instead of deleting history.
+
+---
+
+## 7.7.4 Inspect a Chart Before Installation
+
+I inspected Bitnami's defaults with:
+
+```bash
+helm show values \
+  bitnami/nginx \
+  --version 25.1.11 \
+  > /tmp/bitnami-nginx-default-values.yaml
+```
+
+The default file contained about 1307 lines. Important defaults included:
+
+```text
+replicaCount: 1
+service.type: LoadBalancer
+resourcesPreset: nano
+resources: {}
+```
+
+I rendered the chart locally with my values file:
+
+```bash
+helm template shopstack-nginx-preview \
+  bitnami/nginx \
+  --namespace helm-lab \
+  --version 25.1.11 \
+  --values charts/helm-lab-values.yaml \
+  > /tmp/shopstack-nginx-preview.yaml
+```
+
+The rendered output included resources such as a NetworkPolicy, PodDisruptionBudget, ServiceAccount, Secret, Service, and Deployment. It showed:
+
+```text
+replicas: 3
+Service type: ClusterIP
+```
+
+The preview was not installed; `helm list` still contained only the real `shopstack-nginx-lab` release.
+
+---
+
+## 7.7.5 Author and Deploy the ShopStack Frontend Chart
+
+I scaffolded:
+
+```bash
+helm create charts/frontend-chart
+```
+
+and then deliberately trimmed the generated chart to the Task 4 frontend resources.
+
+The final chart contains:
+
+```text
+charts/frontend-chart/Chart.yaml
+charts/frontend-chart/values.yaml
+charts/frontend-chart/templates/deployment.yaml
+charts/frontend-chart/templates/service.yaml
+charts/frontend-chart/templates/ingress.yaml
+charts/frontend-chart/.helmignore
+```
+
+The chart metadata is:
+
+```text
+chart version: 0.1.0
+appVersion: 0.2.0
+```
+
+The default values parameterize:
+
+```text
+replicaCount: 3
+image.repository: ghcr.io/culerty516/shopstack-frontend
+image.tag: 0.2.0
+image.pullPolicy: IfNotPresent
+service.type: ClusterIP
+service.port: 80
+ingress.className: nginx
+ingress.host: shopstack.local
+resource requests: 50m CPU / 64Mi
+resource limits: 200m CPU / 128Mi
+```
+
+The Deployment template also preserves the `/healthz` probes and non-root UID/GID `10001`.
+
+Validation:
+
+```bash
+helm lint charts/frontend-chart
+```
+
+returned:
+
+```text
+1 chart(s) linted, 0 chart(s) failed
+```
+
+The only lint note was the optional recommendation to add an icon.
+
+I rendered the chart locally and verified the generated objects were only:
+
+```text
+Service
+Deployment
+Ingress
+```
+
+with the correct multi-architecture GHCR image, three replicas, resources, ClusterIP Service, and `shopstack.local` Ingress.
+
+The chart and Helm lab values were committed as:
+
+```text
+a2918fc Add ShopStack frontend Helm chart
+```
+
+### Replace the loose frontend resources with the Helm release
+
+Before Helm installation, there was no Helm release in `shopstack`; the frontend Deployment, Service, and Ingress were still the loose-manifest versions.
+
+I explicitly deleted those three plain-managed frontend resources and confirmed they no longer existed. I then installed the chart using the CI/CD-friendly form:
+
+```bash
+helm upgrade --install shopstack-frontend \
+  charts/frontend-chart \
+  --namespace shopstack \
+  --wait \
+  --timeout 5m
+```
+
+Helm reported:
+
+```text
+Release "shopstack-frontend" does not exist. Installing it now.
+STATUS: deployed
+REVISION: 1
+```
+
+The Helm-managed Deployment became `3/3`, the Service had three endpoints on port `8080`, and the Ingress advertised `shopstack.local`.
+
+Through the ingress-nginx port-forward:
+
+```text
+Version: 0.2.0
+Release: Kubernetes-ready frontend
+```
+
+and `/healthz` returned HTTP `200`.
+
+I also verified Helm ownership metadata on the Deployment, Service, and Ingress:
+
+```text
+managed-by=Helm
+release-name=shopstack-frontend
+release-namespace=shopstack
+```
+
+### Helm lifecycle vs loose manifests
+
+With loose manifests, Kubernetes stores objects but does not have an application-level release concept connecting all of them into one versioned unit. I must track which YAML files belong together and explicitly apply/delete them.
+
+With Helm, the release record groups the rendered resources and their revision history. Running:
+
+```text
+helm uninstall shopstack-frontend -n shopstack
+```
+
+would remove the resources owned by that release. I did not uninstall the final frontend release because it is the desired end state for the next tasks.
+
+---
+
+## 7.7.6 Stretch Goal — Package and Distribute the Chart with OCI
+
+I packaged the chart:
+
+```bash
+helm package \
+  charts/frontend-chart \
+  --destination /tmp/shopstack-helm-packages
+```
+
+The package was:
+
+```text
+frontend-chart-0.1.0.tgz
+```
+
+and `helm show chart` confirmed:
+
+```text
+name: frontend-chart
+version: 0.1.0
+appVersion: 0.2.0
+```
+
+I authenticated Helm to GHCR and pushed the chart as an OCI artifact:
+
+```text
+ghcr.io/culerty516/charts/frontend-chart:0.1.0
+```
+
+The OCI artifact digest was:
+
+```text
+sha256:ca624f3d505df842bd7c1309d91d25c150e83b7c60cf34ca81db4c75ce27cb3f
+```
+
+I then pulled version `0.1.0` back from GHCR. The pulled artifact reported the same OCI digest.
+
+Finally, I compared the local packaged tarball with the tarball pulled back from the registry. Both files had:
+
+```text
+SHA256 36da64dd3eb8be743d9f7fdb10d5b7002cbd42a612a804b59f41beaaf1f1731a
+```
+
+This verified that the downloaded `.tgz` was byte-for-byte identical to the package I pushed.
+
+The OCI artifact digest and the tarball SHA256 are different identifiers for different objects/layers in the distribution model, so they are not expected to be identical to one another.
+
+### Chart repository vs OCI distribution
+
+A traditional Helm chart repository distributes packaged `.tgz` charts over HTTP together with an `index.yaml`; clients add it with `helm repo add` and refresh metadata with `helm repo update`.
+
+An OCI registry stores the chart as an OCI artifact and uses registry workflows such as:
+
+```text
+helm push oci://...
+helm pull oci://...
+```
+
+OCI distribution lets teams use the same registry authentication, access controls, retention/governance, and content-addressed digest concepts for both container images and Helm charts. In this lab, GHCR now stores both the ShopStack frontend image and the frontend Helm chart.
+
+---
+
+# Checkpoint Questions
+
+## 1. What is the difference between a Service of type `ClusterIP`, `NodePort`, and `LoadBalancer`?
+
+`ClusterIP` exposes a stable virtual IP that is reachable only inside the cluster. It is the normal choice for internal service-to-service communication and was used for the ShopStack frontend Service.
+
+`NodePort` allocates a port on each Kubernetes node and forwards traffic received on `<node-ip>:<node-port>` to the Service. It makes a Service externally reachable if the node network/firewall allows it, but exposes infrastructure details and is usually a lower-level building block rather than the preferred production entry point.
+
+`LoadBalancer` asks an integrated cloud/controller implementation to provision or attach an external load balancer and route it to the Service. On a bare kubeadm cluster without such an integration, the external IP can remain `pending`, which is exactly what was observed with the Bitnami lab release.
+
+---
+
+## 2. What actually happens inside the cluster when you run `kubectl apply -f deployment.yaml`?
+
+`kubectl` reads the manifest, resolves the target API resource, and sends the desired object to the Kubernetes API server using an apply/patch operation. The API server authenticates and authorizes the request, runs admission, validates/defaults the object, and stores the resulting desired state in etcd.
+
+For a Deployment, the Deployment controller notices the desired state and creates/updates a ReplicaSet. The ReplicaSet controller creates the required Pods. The scheduler assigns unscheduled Pods to suitable nodes. Kubelets on those nodes pull/start the container images through the CRI runtime and continually report status. Other controllers update related state such as EndpointSlices when Pods become Ready.
+
+The important model is reconciliation: `kubectl apply` declares desired state; controllers do the ongoing work needed to make actual state match it.
+
+---
+
+## 3. Why did the broken readiness probe not restart the Pod, while a broken liveness probe would?
+
+Readiness answers: **should this Pod receive traffic now?** A failed readiness probe makes the Pod NotReady and removes it from normal Service endpoints, but the process may still be healthy and useful while warming up or waiting on a dependency.
+
+Liveness answers: **is this container still healthy enough to keep running?** Repeated liveness failure tells kubelet that the container should be restarted according to its restart policy.
+
+In this lab, the intentionally broken readiness path returned HTTP 404, the Pod remained Running with restart count 0, and the EndpointSlice marked it `ready:false`.
+
+---
+
+## 4. What problem does Helm solve that plain `kubectl apply` does not, and when might plain manifests or Kustomize be preferable?
+
+Helm packages multiple Kubernetes resources as one versioned application release. It provides templating/values, reusable configuration, dependency packaging, release revision history, upgrade, rollback, and uninstall semantics.
+
+Plain manifests can be preferable when the application is small and explicit YAML is clearer than introducing a template language. Kustomize can be preferable when I want to keep valid plain Kubernetes YAML and layer environment-specific patches/overlays without turning the manifests into templates.
+
+Helm is especially valuable for a reusable application package with multiple configurable environments; plain YAML/Kustomize can be simpler for platform resources where transparency and direct Kubernetes-native configuration matter more than application packaging.
+
+---
+
+## 5. What does `helm upgrade --install` do, and why is it the standard form in CI/CD pipelines?
+
+`helm upgrade --install <release> <chart>` is an idempotent-style release command:
+
+- if the named release exists, Helm upgrades it;
+- if it does not exist, Helm installs it.
+
+A pipeline therefore does not need separate branching logic for first deployment versus later releases. The same command can converge the release to the chart/values provided by that CI/CD run.
+
+In this task, the first `shopstack-frontend` invocation printed that the release did not exist and installed revision 1.
+
+---
+
+## 6. Where does Helm store release state, and what are the security implications?
+
+Helm 3 normally stores release state as Kubernetes Secrets in the release namespace. Those records allow Helm to reconstruct release history and perform operations such as rollback.
+
+Kubernetes Secret data is not magically confidential merely because the resource kind is `Secret`; its API representation is base64-encoded and the data may also exist in etcd. Access must therefore be protected with Kubernetes RBAC and, for stronger protection, encryption at rest for Kubernetes/etcd data.
+
+A user who can read Helm release Secrets may learn rendered configuration, including values that should never have contained plaintext credentials in the first place. Sensitive values should come from a proper secret-management workflow rather than being embedded casually in chart values.
+
+---
+
+## 7. Why should a container run as a non-root user, and what does a multi-stage build buy you?
+
+Running as non-root limits the privileges available if the application or one of its dependencies is compromised. It reduces the chance that a container escape or accidental filesystem operation immediately has root-level impact and works with Kubernetes security controls such as `runAsNonRoot`.
+
+A multi-stage build separates build-time tooling from the final runtime filesystem. Compilers, package managers, source trees, and temporary build artifacts can remain in an earlier stage while only the final executable/runtime files are copied into the last stage. This usually reduces image size and attack surface.
+
+This lab used the task's allowed alternative rather than a multi-stage build: the final image used a small pinned Alpine Python base and ran as UID/GID 10001, reducing the initial ~158 MB image to ~57.6 MB.
+
+---
+
+## 8. What is an OCI image manifest list, and why does a single tag now work on both AMD64 and ARM64 machines?
+
+A multi-platform OCI image tag points to an **image index** (commonly called a manifest list). The index contains references to separate image manifests for combinations such as:
+
+```text
+linux/amd64
+linux/arm64
+```
+
+When a client pulls the tag, the container engine selects the manifest matching its OS/architecture and downloads the correct layers.
+
+The GitHub Actions workflow created one multi-architecture tag for the ShopStack frontend. `docker buildx imagetools inspect` showed both AMD64 and ARM64 entries, and the Apple M2 MacBook pulled/reran the ARM64 variant from the same Git SHA tag successfully.
+
+---
+
+## 9. Why does Podman not need a daemon, and why does that matter for security and systemd integration?
+
+Podman does not require a permanent central daemon to own normal container lifecycles. The CLI/libpod process creates containers through the OCI runtime and supporting processes, then the application container can continue independently.
+
+This removes a long-running privileged daemon from the normal control path and makes rootless operation practical, reducing the privilege boundary for normal users.
+
+It also maps well to systemd because containers can be managed as ordinary service processes. In the VM exercise I generated a user unit, enabled it with `systemctl --user`, enabled lingering, logged out, and confirmed the rootless container service remained active.
+
+---
+
+## 10. Trace the full path of your code: what happens between `git push` and a Pod serving the new version? Which steps are automated and which are still manual?
+
+For the final Task 4 implementation, the `main` branch path is:
+
+```text
+source change in frontend-src/ or deployment workflow
+        |
+git commit + git push main
+        |
+GitHub Actions trigger
+        |
+GitHub-hosted build job
+checkout source
+        |
+QEMU + Docker Buildx
+        |
+build one multi-platform OCI index
+  linux/amd64 + linux/arm64
+        |
+push immutable full Git-SHA tag to GHCR
+        |
+Trivy scans AMD64 and ARM64
+CRITICAL finding would fail the workflow
+        |
+self-hosted ephemeral MacBook deploy runner
+        |
+verify/reuse SSH tunnel to private kubeadm API
+        |
+helm upgrade --install
+--set-string image.tag=<full Git SHA>
+        |
+Kubernetes API stores the new Helm release state
+        |
+Deployment/ReplicaSet creates replacement Pods
+        |
+containerd pulls the matching AMD64 image manifest
+        |
+readiness probe passes
+        |
+Service EndpointSlice includes the Ready Pods
+        |
+CI verifies rollout and exact live image tag
+        |
+CI port-forwards the frontend Service
+        |
+CI checks the page contains the same Git SHA
+and /healthz returns ok
+        |
+Pod is serving the new version
+```
+
+Version-tag (`v*`) runs still build and publish the semver tag, but the deploy job is intentionally restricted to `push` events on `main`.
+
+### Automated in Task 4
+
+- workflow trigger after a push to `main`;
+- multi-architecture AMD64/ARM64 image creation;
+- immutable Git-SHA publication to GHCR;
+- Buildx layer-cache use;
+- CRITICAL vulnerability gate on both architectures;
+- deploy job dependency on successful build and scan jobs;
+- kubeadm API connectivity check;
+- Helm upgrade using the exact Git SHA image;
+- Deployment rollout verification;
+- exact expected-vs-deployed image comparison;
+- application response and `/healthz` verification.
+
+### Still manual in this lab
+
+- the developer still chooses/makes the source change, commits it, and pushes it;
+- because I intentionally used a one-job ephemeral self-hosted runner for this public lab repository, I manually register/start that runner before the deployment workflow needs it;
+- a production promotion/approval policy is not modelled here.
+
+Once the ephemeral runner is registered and listening, the path from a successful `main` push through build, scan, Helm upgrade, rollout, and application verification is automated.
+
+For production, I would prefer GitOps with Argo CD or Flux for the final reconciliation step so hosted CI does not need direct cluster credentials.
+
+---
+
+# Task 4 Summary
+
+All mandatory Task 4 practical requirements were completed successfully.
+
+The final implementation demonstrated:
+
+- verification and operation of the three-node kubeadm cluster from the MacBook Pro through a private SSH tunnel;
+- a minikube scratch cluster and explicit context switching;
+- control-plane component and static-pod inspection;
+- a dedicated `shopstack` namespace;
+- bare-Pod creation only for the required exercise, followed by controller-based workloads;
+- declarative Deployment and ClusterIP Service management;
+- rolling update, revision history, rollback, resource controls, liveness/readiness probes, and readiness-failure behaviour;
+- scaling from 3 to 5 replicas and an HPA that successfully scaled 5 -> 8 at a 50% CPU target;
+- ConfigMap mounting and live ConfigMap update behaviour without a Deployment rollout;
+- Kubernetes Secret consumption through environment variables and secret-management analysis;
+- Online Boutique v0.10.6 deployment, including a documented Apple Silicon minikube resource/emulation investigation and final stable native AMD64 kubeadm deployment;
+- ingress-nginx, `shopstack.local`, `/etc/hosts`, and a working HTTP ingress path;
+- the required deliberate Service-selector failure diagnosed with `get`, `describe`, `logs`, and ephemeral `kubectl debug` containers;
+- a custom Flask frontend with `/` and `/healthz`;
+- a pinned, non-root OCI Dockerfile reduced to ~57.6 MB;
+- Podman-primary build/run/inspect/history workflow and Docker comparison;
+- Trivy scanning with 10 HIGH and 0 CRITICAL findings in the recorded local scan;
+- public GHCR publication of `0.1.0` and `0.2.0`;
+- visible Kubernetes rollout from frontend `0.1.0` to `0.2.0`;
+- semantic-version and immutable Git-SHA tagging discipline;
+- rootless Podman on `k8s-worker-2` managed by a persistent systemd user unit;
+- a GitHub Actions pipeline building one AMD64+ARM64 OCI index with QEMU/Buildx and the built-in `GITHUB_TOKEN`;
+- native ARM64 pull/run verification on the Apple M2;
+- manual workflow dispatch and a CRITICAL Trivy CI gate;
+- a verified GitHub Actions Buildx cache path, reducing the measured build from 38 seconds to 6 seconds on the cached run;
+- an automated `main` deploy stage using an ephemeral self-hosted MacBook runner, Helm, the immutable full Git SHA image tag, rollout verification, and live HTTP health/version checks;
+- a real cross-platform CI troubleshooting cycle where macOS `/bin/bash` rejected Bash 4+ lowercase expansion, followed by a portable `printf | tr` fix and a fully green retry;
+- Helm 3 usage, Bitnami repo install, `--set`, values files, upgrade/history/rollback/list/status, `helm show values`, and `helm template`;
+- a trimmed custom ShopStack Helm chart for Deployment + Service + Ingress;
+- migration from loose frontend resources to the Helm-owned `shopstack-frontend` release;
+- Helm chart packaging plus OCI push/pull through GHCR as an additional stretch exercise.
+
+Both Task 7.6.6 (automated CI deploy stage) and Task 7.7.6 (Helm OCI packaging/distribution) stretch goals were completed.
+
+---
+
+## Final Task 4 Repository Artifacts
+
+The Task 4 work produced the following repository artifact groups:
+
+```text
+k8s/
+├── frontend-configmap.yaml
+├── frontend-deployment.yaml
+├── frontend-hpa.yaml
+├── frontend-own-deployment.yaml
+├── frontend-secret.yaml
+├── frontend-service.yaml
+├── namespace.yaml
+├── online-boutique-ingress.yaml
+└── online-boutique.yaml
+```
+
+```text
+frontend-src/
+├── .dockerignore
+├── Dockerfile
+├── app.py
+└── requirements.txt
+```
+
+```text
+.github/workflows/build-image.yaml
+```
+
+```text
+charts/
+├── helm-history-evidence.txt
+├── helm-lab-values.yaml
+└── frontend-chart/
+    ├── .helmignore
+    ├── Chart.yaml
+    ├── values.yaml
+    └── templates/
+        ├── deployment.yaml
+        ├── ingress.yaml
+        └── service.yaml
+```
+
+Canonical registry locations:
+
+```text
+Container image:
+ghcr.io/culerty516/shopstack-frontend
+
+Helm OCI chart:
+ghcr.io/culerty516/charts/frontend-chart:0.1.0
+```
+
+Important Task 4 commits:
+
+```text
+046aac3 Add containerized ShopStack frontend v0.1.0
+65ccfd1 Release ShopStack frontend v0.2.0
+9b056d3 Add Task 4 Kubernetes manifests
+1618be3 Add multi-arch container CI pipeline
+72b17ba Enable GitHub Actions Buildx cache
+a2918fc Add ShopStack frontend Helm chart
+ad669e3 Add automated Helm deployment stage
+17ea244 Fix macOS deploy runner shell compatibility
+```
+
+---
+
+# Troubleshooting Notes
+
+## Local kubeadm API connection failed because the SSH tunnel was absent
+
+**Symptom**
+
+```text
+The connection to the server 127.0.0.1:6443 was refused
+```
+
+**Cause**
+
+The kubeconfig intentionally points at the local SSH-forwarded API endpoint, but the forwarding SSH process was no longer listening.
+
+**Resolution**
+
+Recreated the tunnel to `10.10.0.10:6443` through `k8s-cp`. `kubectl get nodes` immediately returned all three nodes Ready. I did not modify or reset the cluster.
+
+This same condition appeared again later after changing environments; recreating the tunnel again restored access.
+
+---
+
+## A new Terminal used the wrong Kubernetes context
+
+**Symptom**
+
+A kubeadm frontend lookup returned `NotFound`, and:
+
+```bash
+echo "$KUBECONFIG"
+```
+
+was empty while `kubectl config current-context` reported `minikube`.
+
+**Cause**
+
+The environment variable exported in another terminal is not inherited by a newly opened terminal session.
+
+**Resolution**
+
+Exported:
+
+```text
+~/.kube/task4-final-config
+```
+
+and explicitly selected `kubernetes-admin@kubernetes` before continuing.
+
+This reinforced that `kubectl` errors must be interpreted in the context of the currently selected cluster.
+
+---
+
+## Broken readiness probe stalled the rollout but did not restart the container
+
+**Symptom**
+
+The new frontend Pod was `0/1 Running`; the rollout timed out; readiness returned HTTP 404.
+
+**Cause**
+
+The readiness path had deliberately been changed to `/definitely-not-ready` while liveness still targeted `/`.
+
+**Resolution**
+
+Observed the non-ready EndpointSlice state, restored readiness to `/`, applied the manifest, and the rollout completed.
+
+---
+
+## Literal shell placeholders caused parse/path errors
+
+During troubleshooting I once pasted a command containing a literal placeholder such as:
+
+```text
+<NOT_READY_POD_NAME>
+```
+
+zsh interpreted the angle brackets as shell syntax rather than as documentation text.
+
+I corrected the command by substituting the actual resource name first. This is a reminder that documentation placeholders are not literal shell arguments.
+
+---
+
+## HPA metrics failed under an overly aggressive minikube load test
+
+**Symptom**
+
+The HPA showed an unknown CPU target and events reported failures to fetch metrics from `pods.metrics.k8s.io`.
+
+**Cause**
+
+The first HTTP load-generator test put enough pressure on the small minikube Docker environment that metrics-server itself became unhealthy.
+
+**Resolution**
+
+Allowed the scratch cluster to recover and changed one variable: instead of adding more HTTP load-generator Pods, generated controlled CPU load inside one existing frontend Pod. The metrics pipeline stayed available, CPU reached 81% of request against a 50% target, and HPA successfully scaled the Deployment from 5 to 8.
+
+---
+
+## ConfigMap existed but was not mounted
+
+**Symptom**
+
+The ConfigMap was created but the frontend still served the standard nginx page.
+
+**Cause**
+
+The first Deployment manifest version did not actually contain `volumeMounts`/`volumes` referencing `frontend-config`.
+
+**Resolution**
+
+Added the ConfigMap volume and mounted it read-only at `/usr/share/nginx/html`, then re-applied the Deployment. The frontend served `VERSION_A`, and the later ConfigMap-only update changed it to `VERSION_B` without a Deployment rollout.
+
+---
+
+## Online Boutique was unstable on the Apple M2 minikube scratch cluster
+
+**Symptom**
+
+Multiple services repeatedly failed liveness/readiness probes or entered CrashLoopBackOff while Docker showed sustained CPU saturation.
+
+**Cause**
+
+The exact v0.10.6 images inspected in this run included AMD64 workloads, while minikube was running on Apple Silicon. Emulation combined with the small existing minikube resource allocation produced enough CPU scheduling delay to trigger aggressive one-second health checks.
+
+**Resolution**
+
+I first investigated resource usage and performed limited non-destructive CPU/resource experiments. The existing minikube profile could not be resized through normal `minikube start --cpus=...` without deleting it, and I did not reset the lab. I then moved the final deployment to the task-preferred native AMD64 kubeadm cluster and re-applied the clean upstream manifest. The full demo converged there.
+
+---
+
+## Browser reported `ERR_SSL_PROTOCOL_ERROR` for the Ingress
+
+**Symptom**
+
+The browser failed while curl against the ingress port-forward worked.
+
+**Cause**
+
+The browser attempted HTTPS against local port `8080`, while the port-forward was plain HTTP to ingress-nginx port 80.
+
+**Resolution**
+
+Used the explicit URL:
+
+```text
+http://shopstack.local:8080/
+```
+
+---
+
+## Ingress port-forward lost its backend connection once
+
+**Symptom**
+
+```text
+error: lost connection to pod
+```
+
+**Resolution**
+
+Restarted the same `kubectl port-forward` command. The following session accepted requests normally. No Ingress or cluster configuration change was required.
+
+---
+
+## Deliberate Service selector mismatch removed all frontend endpoints
+
+**Symptom**
+
+The Service existed but `kubectl get endpoints frontend` returned `<none>`. Direct application health inside the Pod still succeeded.
+
+**Cause**
+
+The Service selector was intentionally changed to `app=frontend-broken` while Pods still used `app=frontend`.
+
+**Resolution**
+
+Confirmed the mismatch using `describe`, verified the application using logs and an ephemeral debug container, then re-applied the tracked Online Boutique manifest. Endpoints were restored.
+
+---
+
+## Podman was not installed on the MacBook Pro
+
+**Symptom**
+
+```text
+zsh: command not found: podman
+```
+
+**Resolution**
+
+Installed Podman 6.1.1 with Homebrew, initialized the Linux Podman Machine, and kept it in rootless mode.
+
+---
+
+## First Dockerfile exceeded the approximate image-size target
+
+**Symptom**
+
+The working slim-based image was approximately `158 MB`, slightly above the requested `~150 MB` target.
+
+**Cause**
+
+`podman history` showed that the runtime base dominated the image size.
+
+**Resolution**
+
+Changed to the pinned Alpine Python base and rebuilt the same application as non-root. The Podman image fell to approximately `57.6 MB` while preserving functionality.
+
+---
+
+## `podman manifest inspect` failed on the first GHCR image
+
+**Symptom**
+
+Podman reported that treating a single image as a manifest list was not implemented.
+
+**Cause**
+
+The manually pushed `0.1.0` package at that point was one AMD64 OCI image, not a multi-platform index.
+
+**Resolution**
+
+Used normal image inspection/pull to verify it. The proper AMD64+ARM64 OCI index was subsequently built in Task 7.6 using Buildx.
+
+---
+
+## Anonymous GHCR inspection initially returned `401`
+
+**Cause**
+
+The newly pushed image package was private.
+
+**Resolution**
+
+Changed the package visibility to public, logged Docker out of GHCR, and successfully pulled the image anonymously.
+
+---
+
+## Running the AMD64 release image locally on the M2 produced a platform warning
+
+The manually built `0.2.0` release was intentionally AMD64 so it could run on the kubeadm workers. When I tested that specific image locally on the ARM64 Mac/Podman environment, Podman warned about the architecture mismatch. Emulation still ran it successfully and both application endpoints worked.
+
+The later GitHub Actions multi-architecture image removed this mismatch by publishing both architectures under one tag.
+
+---
+
+## Podman 4.9.3 rejected one `podman info` template field
+
+**Symptom**
+
+A format string containing `.Host.CgroupVersion` failed because that field was not available in the host-info structure exposed by the installed version.
+
+**Resolution**
+
+Re-ran the query with supported fields and confirmed:
+
+```text
+rootless=true arch=amd64
+```
+
+---
+
+## `podman generate systemd` printed a deprecation warning
+
+Podman 4.9.3 recommended Quadlets for modern systemd integration. The task specifically requires `podman generate systemd --new`, so I completed the required exercise and documented the warning. For a new production service I would evaluate Quadlets instead.
+
+---
+
+## Helm 4 was active but the task required Helm 3
+
+**Symptom**
+
+The first `helm version` returned Helm `v4.3.0`.
+
+**Resolution**
+
+Installed the Homebrew `helm@3` keg and placed `/opt/homebrew/opt/helm@3/bin` first in PATH. Verification returned Helm `v3.22.0`, which was used for the rest of the task.
+
+---
+
+## Buildx cache flags were present but no cache hit was visible
+
+**Symptom**
+
+The workflow contained `cache-from type=gha` and `cache-to type=gha`, but the first logs did not show BuildKit importing the expected cache manifest.
+
+**Cause**
+
+The inline Buildx invocation did not yet have the GitHub Actions cache runtime variables exposed in the job environment.
+
+**Resolution**
+
+Added the GitHub Actions runtime exposure step, ran once to populate the cache, and then triggered another workflow manually. The next logs showed `importing cache manifest from gha` and many `CACHED` steps. The measured build time improved from 38 seconds to 6 seconds.
+
+---
+
+## First self-hosted CI deploy failed with `bad substitution`
+
+**Symptom**
+
+The first deployment-enabled run, `34820950439`, completed the multi-architecture build and both Trivy scans, then failed at the `Deploy immutable SHA image with Helm` step. The runner reported:
+
+```text
+bad substitution
+```
+
+**Evidence**
+
+The preceding connectivity step had already returned all three kubeadm nodes as `Ready`, so this was not a Kubernetes API, SSH tunnel, kubeconfig, or Helm connectivity failure. The error occurred while assigning the GHCR repository string before `helm upgrade` was executed.
+
+**Cause**
+
+The workflow used:
+
+```bash
+${GITHUB_REPOSITORY_OWNER,,}
+```
+
+which is Bash 4+ lowercase syntax. It worked on the GitHub-hosted Ubuntu runner, but the self-hosted macOS job executed with Apple's older `/bin/bash`, which does not support that expansion.
+
+**Resolution**
+
+Changed the deploy job only, replacing the unsupported expansion with the portable form:
+
+```bash
+IMAGE_OWNER="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+```
+
+I verified this with `/bin/bash` locally and committed:
+
+```text
+17ea244 Fix macOS deploy runner shell compatibility
+```
+
+Because the runner was configured with `--ephemeral`, the failed job still consumed that one runner registration. GitHub removed its `.credentials` and `.runner` state, so I registered a new ephemeral runner for the retry.
+
+The next run, `34822419994`, completed build, scan, Helm deployment, rollout verification, image-tag verification, application response verification, and runner deregistration successfully.
+
+**Lesson**
+
+A workflow that is valid on a GitHub-hosted Linux runner can still fail on a self-hosted runner because the shell/runtime version is part of the execution environment. CI scripts intended to run across heterogeneous runners should avoid unnecessary version-specific shell syntax or explicitly control the shell version.
+
+---
+
+## Git history needed a meaningful `0.1.0` application commit
+
+**Observation**
+
+The application/container work had progressed through `0.2.0` before the required initial application commit was persisted.
+
+**Resolution**
+
+Before committing the Task 4 application artifacts, I restored the actual `0.1.0` state, committed it with a meaningful message, then restored and committed `0.2.0` separately. This created auditable source history for both releases rather than falsely documenting a commit that had never existed.
+
+---
+
+**Task 4 status: COMPLETE**
+---
