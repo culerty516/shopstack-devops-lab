@@ -185,7 +185,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          IMAGE_REPOSITORY="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/shopstack-frontend"
+          IMAGE_OWNER="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          IMAGE_REPOSITORY="ghcr.io/${IMAGE_OWNER}/shopstack-frontend"
 
           helm upgrade --install shopstack-frontend \
             charts/frontend-chart \
@@ -215,7 +216,8 @@ jobs:
               -o jsonpath='{.spec.template.spec.containers[0].image}'
           )"
 
-          EXPECTED_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/shopstack-frontend:${GITHUB_SHA}"
+          IMAGE_OWNER="$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          EXPECTED_IMAGE="ghcr.io/${IMAGE_OWNER}/shopstack-frontend:${GITHUB_SHA}"
 
           echo "Expected: ${EXPECTED_IMAGE}"
           echo "Deployed: ${DEPLOYED_IMAGE}"
