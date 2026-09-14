@@ -138,3 +138,129 @@ jobs:
             echo "- Multi-arch build time: **${{ needs.build.outputs.build_seconds }} seconds**"
             echo "- Trivy gate: no CRITICAL vulnerabilities detected"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+  deploy:
+    name: Deploy SHA image to kubeadm
+    needs:
+      - build
+      - scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on:
+      - self-hosted
+      - task4-deploy
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure local CLI paths
+        shell: bash
+        run: |
+          echo "/opt/homebrew/bin" >> "${GITHUB_PATH}"
+          echo "/opt/homebrew/opt/helm@3/bin" >> "${GITHUB_PATH}"
+          echo "KUBECONFIG=${HOME}/.kube/task4-final-config" >> "${GITHUB_ENV}"
+
+      - name: Ensure kubeadm API tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! nc -z 127.0.0.1 6443; then
+            ssh -fN \
+              -o BatchMode=yes \
+              -o ExitOnForwardFailure=yes \
+              -L 127.0.0.1:6443:10.10.0.10:6443 \
+              k8s-cp
+          fi
+
+          kubectl \
+            --context kubernetes-admin@kubernetes \
+            get nodes
+
+      - name: Deploy immutable SHA image with Helm
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_REPOSITORY="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/shopstack-frontend"
+
+          helm upgrade --install shopstack-frontend \
+            charts/frontend-chart \
+            --namespace shopstack \
+            --kube-context kubernetes-admin@kubernetes \
+            --set image.repository="${IMAGE_REPOSITORY}" \
+            --set-string image.tag="${GITHUB_SHA}" \
+            --wait \
+            --timeout 5m
+
+      - name: Verify Kubernetes rollout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl \
+            --context kubernetes-admin@kubernetes \
+            rollout status deployment/frontend \
+            -n shopstack \
+            --timeout=180s
+
+          DEPLOYED_IMAGE="$(
+            kubectl \
+              --context kubernetes-admin@kubernetes \
+              get deployment frontend \
+              -n shopstack \
+              -o jsonpath='{.spec.template.spec.containers[0].image}'
+          )"
+
+          EXPECTED_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/shopstack-frontend:${GITHUB_SHA}"
+
+          echo "Expected: ${EXPECTED_IMAGE}"
+          echo "Deployed: ${DEPLOYED_IMAGE}"
+
+          test "${DEPLOYED_IMAGE}" = "${EXPECTED_IMAGE}"
+
+      - name: Verify application response
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl \
+            --context kubernetes-admin@kubernetes \
+            port-forward \
+            -n shopstack \
+            service/frontend \
+            18088:80 \
+            > /tmp/shopstack-ci-port-forward.log 2>&1 &
+
+          PF_PID=$!
+          trap 'kill "${PF_PID}" 2>/dev/null || true' EXIT
+
+          for attempt in {1..20}; do
+            if curl -fsS http://127.0.0.1:18088/healthz >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          BODY="$(curl -fsS http://127.0.0.1:18088/)"
+
+          echo "${BODY}"
+
+          echo "${BODY}" | grep -F "${GITHUB_SHA}"
+          curl -fsS http://127.0.0.1:18088/healthz | grep -Fx "ok"
+
+      - name: Record deployment summary
+        shell: bash
+        run: |
+          {
+            echo "### Deployment"
+            echo
+            echo "- Cluster: kubeadm"
+            echo "- Namespace: \`shopstack\`"
+            echo "- Helm release: \`shopstack-frontend\`"
+            echo "- Image tag: \`${GITHUB_SHA}\`"
+            echo "- Deployment method: \`helm upgrade --install --set-string image.tag=<git-sha>\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
