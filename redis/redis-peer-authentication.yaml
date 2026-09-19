@@ -1,0 +1,11 @@
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: redis-strict-mtls
+  namespace: data
+spec:
+  selector:
+    matchLabels:
+      app: redis
+  mtls:
+    mode: STRICT

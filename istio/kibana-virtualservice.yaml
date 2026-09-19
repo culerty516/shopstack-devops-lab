@@ -1,0 +1,16 @@
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: kibana
+  namespace: shopstack
+spec:
+  hosts:
+    - kibana.shopstack.local
+  gateways:
+    - shopstack-gateway
+  http:
+    - route:
+        - destination:
+            host: shopstack-kb-http.data.svc.cluster.local
+            port:
+              number: 5601

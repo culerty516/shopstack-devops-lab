@@ -7191,3 +7191,3330 @@ to retrieve the loadgenerator logs successfully.
 
 **Task 5 status: COMPLETE**
 ---
+
+# Task 6 — Data Stores: PostgreSQL, Redis, Elasticsearch, NebulaGraph
+
+**Final Run period:** 2026-09-15 to 2026-09-19<br>
+**Date completed:** 2026-09-19<br>
+**Working machine:** MacBook Pro<br>
+**Primary Kubernetes environment:** Three-node kubeadm cluster on Google Compute Engine<br>
+**Kubernetes version:** v1.37.0<br>
+**Container runtime:** containerd 2.2.1<br>
+**Node OS:** Ubuntu 24.04.4 LTS<br>
+**Application namespace:** `shopstack`<br>
+**Data-store namespace:** `data`<br>
+**Istio namespace:** `istio-system`<br>
+**ECK namespace:** `elastic-system`<br>
+**Nebula Operator namespace:** `nebula-system`<br>
+**Kubeconfig:** `~/.kube/task4-final-config`<br>
+
+The Final Run reused the kubeadm cluster from Tasks 3–5:
+
+```text
+k8s-cp        10.10.0.10   control-plane   v1.37.0
+k8s-worker-1  10.10.0.11   worker          v1.37.0
+k8s-worker-2  10.10.0.12   worker          v1.37.0
+```
+
+Each VM remained at approximately 2 vCPU and 4 GiB RAM. I did not increase the VM size just to make the Task 6 data stores fit.
+
+The Kubernetes API was still private. Local `kubectl` access depended on the SSH tunnel:
+
+```bash
+ssh -fN \
+  -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:6443:10.10.0.10:6443 \
+  k8s-cp
+```
+
+At the start of Task 6 the tunnel was not running, so:
+
+```bash
+kubectl get nodes -o wide
+```
+
+returned:
+
+```text
+The connection to the server 127.0.0.1:6443 was refused
+```
+
+`lsof` showed no listener on TCP/6443. After recreating the SSH forward, all three nodes returned `Ready`.
+
+---
+
+# Storage Preparation for Task 6
+
+The kubeadm cluster initially had no StorageClass, CSI driver, PV, or PVC:
+
+```text
+kubectl get storageclass
+No resources found
+
+kubectl get csidriver
+No resources found
+
+kubectl get pv
+No resources found
+
+kubectl get pvc -A
+No resources found
+```
+
+The Kubernetes nodes also had no `providerID` and no region/zone topology labels. GCE metadata confirmed all three VMs were in `us-central1-a`.
+
+The VM service-account scopes contained storage/logging/monitoring-related scopes but no Compute Engine scope. Rather than turning Task 6 into a cloud-CSI reconfiguration exercise, I used the simple local provisioner that the later storage task explicitly allows for kubeadm exercises.
+
+I installed Rancher Local Path Provisioner v0.0.36:
+
+```bash
+kubectl apply -f \
+  https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.36/deploy/local-path-storage.yaml
+```
+
+The provisioner became available and created:
+
+```text
+NAME         PROVISIONER             RECLAIM   BINDING
+local-path   rancher.io/local-path   Delete    WaitForFirstConsumer
+```
+
+This StorageClass was used only as the Task 6 lab persistence substrate. It is **not** being treated as the Task 7 production-style block-storage / CSI implementation.
+
+---
+
+# 9.1 PostgreSQL on Kubernetes
+
+## 9.1.1 Namespace and credential reuse
+
+I created the `data` namespace declaratively:
+
+```text
+data/namespace.yaml
+```
+
+Before creating PostgreSQL, I verified the existing Task 7.3/Task 4 frontend database Secret:
+
+```text
+namespace: shopstack
+name:      frontend-db-secret
+type:      Opaque
+keys:
+  db-password
+  db-user
+```
+
+The existing values were verified to match the intended Final Run lab credentials.
+
+Kubernetes Secrets are namespace-scoped, so a Pod in `data` cannot directly reference a Secret stored in `shopstack`. I copied the same encoded Secret data into an equivalent runtime Secret:
+
+```text
+data/frontend-db-secret
+```
+
+I compared the source and destination encoded values and received:
+
+```text
+PASS: data/db-user exactly matches Task 7.3 shopstack/db-user
+PASS: data/db-password exactly matches Task 7.3 shopstack/db-password
+```
+
+The credential values were not committed as a new plaintext Secret manifest.
+
+---
+
+## 9.1.2 PostgreSQL StatefulSet and headless Service
+
+Files:
+
+```text
+data/postgres-headless-service.yaml
+data/postgres-statefulset.yaml
+```
+
+The PostgreSQL design was:
+
+```text
+PostgreSQL image: postgres:16
+StatefulSet:      postgres
+Pod:              postgres-0
+Namespace:        data
+Service:          postgres-headless
+Service type:     headless (clusterIP: None)
+Port:             5432
+PVC:              5Gi
+Access mode:      ReadWriteOnce
+StorageClass:     local-path
+```
+
+The StatefulSet used the copied `frontend-db-secret`:
+
+```text
+POSTGRES_USER     <- db-user
+POSTGRES_PASSWORD <- db-password
+```
+
+It also configured:
+
+```text
+PGDATA=/var/lib/postgresql/data/pgdata
+```
+
+Resource settings:
+
+```text
+requests:
+  cpu: 100m
+  memory: 256Mi
+
+limits:
+  cpu: 1
+  memory: 1Gi
+```
+
+Readiness and liveness checks used `pg_isready`.
+
+I validated both manifests with server-side dry-run before applying them.
+
+The workload converged successfully:
+
+```text
+NAME       READY
+postgres   1/1
+```
+
+Initial Pod state:
+
+```text
+postgres-0   1/1   Running   0 restarts   k8s-worker-2
+```
+
+The data PVC bound dynamically:
+
+```text
+PVC:          postgres-data-postgres-0
+Status:       Bound
+Capacity:     5Gi
+Access mode:  ReadWriteOnce
+StorageClass: local-path
+PV:           pvc-8ce1363e-8b71-49b9-bd9f-0747bbc8e2f5
+```
+
+The headless Service showed:
+
+```text
+postgres-headless   ClusterIP   None   5432/TCP
+```
+
+### Why StatefulSet instead of Deployment?
+
+A StatefulSet exists for workloads that need stable identity and stable storage.
+
+For PostgreSQL this matters because:
+
+- `postgres-0` has a stable ordinal identity;
+- the headless Service provides stable network naming;
+- `volumeClaimTemplates` keep the StatefulSet ordinal associated with its PVC;
+- ordered lifecycle semantics are available for stateful replicas.
+
+A Deployment treats Pods as interchangeable. That is ideal for stateless application replicas but less suitable when one replica must remain associated with a particular persistent volume and stable identity.
+
+Running a production relational database in Kubernetes is still a debated operational choice. Kubernetes can run it, but the team must own storage reliability, backups, failover, upgrades, monitoring, and recovery. For many production systems a managed database is the better choice when those operational guarantees are more important than running the database inside the cluster.
+
+---
+
+## 9.1.3 Create `boutique` and `products`
+
+I created a temporary PostgreSQL 16 client Pod in the `data` namespace and connected through the headless Service.
+
+Version check:
+
+```text
+PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2)
+```
+
+I created:
+
+```text
+database: boutique
+owner:    shopstack-demo-user
+```
+
+Then:
+
+```sql
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    sku VARCHAR(32) UNIQUE NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    category VARCHAR(50) NOT NULL,
+    price NUMERIC(10,2) NOT NULL
+);
+```
+
+Five rows were inserted:
+
+| ID | SKU | Product | Category | Price |
+|---:|---|---|---|---:|
+| 1 | SKU-001 | Mouse | electronics | 199.00 |
+| 2 | SKU-002 | Keyboard | electronics | 699.00 |
+| 3 | SKU-003 | USB Hub | electronics | 329.00 |
+| 4 | SKU-004 | Laptop Stand | accessories | 249.00 |
+| 5 | SKU-005 | Bottle | lifestyle | 129.00 |
+
+Verification:
+
+```text
+SELECT COUNT(*) FROM products;
+5
+```
+
+The temporary client Pod was deleted after the bootstrap.
+
+---
+
+# 9.2 PostgreSQL Backup and Restore
+
+## 9.2.1 Logical backup with `pg_dump`
+
+I created a custom-format backup from inside `postgres-0`:
+
+```bash
+pg_dump \
+  -U "$POSTGRES_USER" \
+  -d boutique \
+  -Fc \
+  -f /tmp/boutique.dump
+```
+
+The dump size was approximately 3.4 KiB.
+
+`pg_restore -l` showed the expected `products` table, sequence, constraints, and table data.
+
+The in-cluster SHA-256 was:
+
+```text
+ea6fb8d4e88f74e0e545489a8c52831ea9e97be109ed58d6457e88d0dfcbc49f
+```
+
+I copied the dump to the MacBook:
+
+```bash
+kubectl cp \
+  data/postgres-0:/tmp/boutique.dump \
+  /tmp/shopstack-task6/boutique.dump
+```
+
+Local verification returned the same SHA-256:
+
+```text
+ea6fb8d4e88f74e0e545489a8c52831ea9e97be109ed58d6457e88d0dfcbc49f
+```
+
+`file` identified it as:
+
+```text
+PostgreSQL custom database dump - v1.15-0
+```
+
+I then copied the external backup back into the PostgreSQL Pod as a separate restore input:
+
+```text
+/tmp/boutique-restore.dump
+```
+
+and verified its checksum again.
+
+---
+
+## 9.2.2 Disaster drill
+
+Before destruction:
+
+```text
+products row count = 5
+```
+
+I deliberately dropped the table:
+
+```sql
+DROP TABLE products;
+```
+
+The next query failed as expected:
+
+```text
+ERROR: relation "products" does not exist
+```
+
+I restored the database objects and data with:
+
+```bash
+pg_restore \
+  -U "$POSTGRES_USER" \
+  -d boutique \
+  /tmp/boutique-restore.dump
+```
+
+Post-restore verification returned:
+
+```text
+products row count = 5
+```
+
+and the exact five expected products were present again.
+
+`postgres-0` remained healthy:
+
+```text
+1/1 Running
+```
+
+at this stage.
+
+### Restore runbook
+
+I created:
+
+```text
+runbooks/postgres-restore.md
+```
+
+The first attempt to create the Markdown runbook used a shell heredoc containing Markdown code fences and left the terminal at a `heredoc>` prompt. I removed the incomplete file and recreated it using safe inner fencing. The final runbook had the expected sections:
+
+```text
+Scope
+Create a logical backup
+Copy the backup outside the cluster
+Disaster drill
+Restore from the external backup copy
+Verify recovery
+Recovery Notes
+```
+
+The final file was approximately 4.3 KiB.
+
+---
+
+## 9.2.3 Nightly backup CronJob
+
+Tracked files:
+
+```text
+data/postgres-backup-pvc.yaml
+data/postgres-backup-cronjob.yaml
+```
+
+### First implementation in `data`
+
+The first version used:
+
+```text
+namespace: data
+schedule: 0 2 * * *
+dedicated backup PVC: postgres-backups
+size: 2Gi
+```
+
+A manual Job created from the CronJob completed:
+
+```text
+NAME                     STATUS     COMPLETIONS
+postgres-backup-manual   Complete   1/1
+```
+
+The Job log showed:
+
+```text
+Creating backup: /backups/boutique-20260915T142841Z.dump
+Backup completed:
+-rw-r--r-- ... 3.4K ... /backups/boutique-20260915T142841Z.dump
+```
+
+The dedicated PVC bound successfully.
+
+### Final implementation in `shopstack`
+
+While implementing PostgreSQL network isolation, I chose an Istio `AuthorizationPolicy` that allows PostgreSQL only from the `shopstack` namespace.
+
+That meant the final backup workload also needed to originate from `shopstack`.
+
+I therefore changed the tracked backup PVC and CronJob to:
+
+```text
+namespace: shopstack
+```
+
+The CronJob now connects to:
+
+```text
+postgres-headless.data.svc.cluster.local:5432
+```
+
+The final Pod template carries:
+
+```text
+app=postgres-backup
+```
+
+and, because `shopstack` already has automatic sidecar injection, the backup Job received:
+
+```text
+istio-init
+istio-proxy
+pg-dump
+```
+
+The final runtime backup PVC was:
+
+```text
+shopstack/postgres-backups
+PV: pvc-02979155-64cc-4600-b5c9-22929ead0c85
+Capacity: 2Gi
+Status: Bound
+```
+
+A manual test from the final CronJob completed:
+
+```text
+NAME                             STATUS     COMPLETIONS
+postgres-backup-shopstack-test   Complete   1/1
+```
+
+Log:
+
+```text
+Creating backup: /backups/boutique-20260915T150050Z.dump
+Backup completed:
+-rw-r--r-- ... 3.9K ... /backups/boutique-20260915T150050Z.dump
+```
+
+After the authorization policy was enabled, a second test also completed:
+
+```text
+postgres-backup-authz-test   Complete   1/1
+```
+
+The earlier `data` CronJob was deleted. Its old runtime backup PVC remained Bound, but the repository manifest represents the final `shopstack` implementation.
+
+---
+
+## Logical vs physical PostgreSQL backup
+
+`pg_dump` is a **logical backup**. It exports database objects and rows at the logical SQL level. It is portable and useful for migrations, selective restores, and small/medium databases, but a large restore can take significant time.
+
+A **physical backup** copies the PostgreSQL data representation, usually with a base backup and WAL archiving. It is designed for whole-cluster recovery and is the basis for point-in-time recovery.
+
+Point-in-time recovery is required when I need the database as it existed at a particular moment, for example immediately before an accidental destructive statement. A base backup can be restored and WAL replay stopped at the desired recovery target.
+
+---
+
+# 9.3 PostgreSQL Operations and Access Control
+
+## 9.3.1 Read-only `reporting` user
+
+I generated a random runtime password and stored it in:
+
+```text
+data/reporting-db-secret
+```
+
+with keys:
+
+```text
+db-user
+db-password
+```
+
+The first role-creation attempt used `psql -c` together with:
+
+```text
+:'reporting_password'
+```
+
+and failed with:
+
+```text
+ERROR: syntax error at or near ":"
+```
+
+The failed command did not create the role.
+
+I retained the generated password and changed only the SQL-input method. Feeding SQL to `psql` through stdin succeeded:
+
+```text
+CREATE ROLE
+```
+
+The role was then granted:
+
+```sql
+GRANT CONNECT ON DATABASE boutique TO reporting;
+GRANT USAGE ON SCHEMA public TO reporting;
+GRANT SELECT ON TABLE products TO reporting;
+```
+
+Validation from a temporary reporting client:
+
+```text
+SELECT from products  -> succeeds
+INSERT into products  -> ERROR: permission denied for table products
+DELETE from products  -> ERROR: permission denied for table products
+```
+
+The row count remained:
+
+```text
+5
+```
+
+`\dp products` showed:
+
+```text
+reporting=r/...
+```
+
+which confirmed read-only table permission.
+
+---
+
+## 9.3.2 Restrict PostgreSQL to `shopstack`
+
+I inspected the CNI implementation before relying on Kubernetes NetworkPolicy.
+
+The kubeadm cluster uses Flannel:
+
+```text
+kube-flannel/kube-flannel-ds
+```
+
+and there was no Calico DaemonSet.
+
+The CNI configuration on the worker showed the Flannel plugin. Vanilla Flannel does not provide NetworkPolicy enforcement by itself.
+
+The task permits either Kubernetes NetworkPolicy **or** Istio `AuthorizationPolicy`, so I used the already-running Istio service mesh for the actual PostgreSQL enforcement.
+
+### Inject PostgreSQL into Istio
+
+I added:
+
+```text
+sidecar.istio.io/inject: "true"
+```
+
+to the PostgreSQL Pod template.
+
+After rollout, `postgres-0` contained:
+
+```text
+application container:
+  postgres
+
+init/restartable sidecars:
+  istio-init
+  istio-proxy
+```
+
+and reported:
+
+```text
+postgres-0   2/2 Running
+```
+
+The original PostgreSQL PVC remained Bound and the products row count remained `5`.
+
+### Security resources
+
+Files:
+
+```text
+data/postgres-peer-authentication.yaml
+data/postgres-authorization-policy.yaml
+```
+
+The policy design was:
+
+```text
+PeerAuthentication:
+  selector: app=postgres
+  mTLS: STRICT
+
+AuthorizationPolicy:
+  selector: app=postgres
+  action: ALLOW
+  source namespace: shopstack
+  destination port: 5432
+```
+
+### Positive test
+
+A PostgreSQL client in `shopstack` received an Istio sidecar and, using valid credentials, returned:
+
+```text
+SELECT COUNT(*) FROM products;
+5
+```
+
+### Negative test
+
+I created a separate namespace:
+
+```text
+postgres-deny-test
+```
+
+enabled sidecar injection, copied the same valid database credentials into it, and ran the same query.
+
+The client was rejected:
+
+```text
+psql: error: connection to server at
+"postgres-headless.data.svc.cluster.local" ...
+server closed the connection unexpectedly
+
+exit code 2
+```
+
+Because both tests used valid database credentials and both clients were mesh-enabled, this demonstrated namespace-based Istio authorization rather than authentication failure.
+
+The deny-test namespace was deleted afterward.
+
+---
+
+## 9.3.3 Performance and active connections
+
+I ran:
+
+```sql
+EXPLAIN ANALYZE
+SELECT *
+FROM products
+WHERE category = 'electronics';
+```
+
+Observed plan:
+
+```text
+Seq Scan on products
+actual rows: 3
+Rows Removed by Filter: 2
+Planning Time: 0.546 ms
+Execution Time: 0.072 ms
+```
+
+The three matching rows were:
+
+```text
+SKU-001 Mouse    199.00
+SKU-002 Keyboard 699.00
+SKU-003 USB Hub  329.00
+```
+
+With only five rows, a sequential scan is reasonable; adding an index solely for this tiny test table would not provide meaningful benefit.
+
+`pg_stat_activity` showed one active `boutique` session:
+
+```text
+usename: shopstack-demo-user
+datname: boutique
+state:   active
+```
+
+The grouped connection check returned:
+
+```text
+active = 1
+```
+
+---
+
+# 9.4 Redis Cache Layer
+
+## 9.4.1 Redis StatefulSet and authentication
+
+Files:
+
+```text
+redis/redis-service.yaml
+redis/redis-statefulset.yaml
+```
+
+I generated a random Redis password and stored it in the runtime Secret:
+
+```text
+data/redis-auth-secret
+key: redis-password
+```
+
+Redis was deployed as:
+
+```text
+Redis version:   8.10.1
+Namespace:       data
+StatefulSet:     redis
+Pod:             redis-0
+Service:         redis
+Port:            6379
+PVC:             1Gi
+Access mode:     RWO
+StorageClass:    local-path
+```
+
+The Redis server command included:
+
+```text
+--requirepass "$REDIS_PASSWORD"
+--appendonly yes
+--appendfsync everysec
+--dir /data
+```
+
+Resource settings:
+
+```text
+requests:
+  cpu: 50m
+  memory: 128Mi
+
+limits:
+  cpu: 500m
+  memory: 512Mi
+```
+
+Initial state:
+
+```text
+redis-0   1/1 Running
+PVC redis-data-redis-0 -> Bound
+PV pvc-2c555873-4c94-42ef-b8a8-eeba5585dece
+```
+
+Runtime verification:
+
+```text
+appendonly
+yes
+
+appendfsync
+everysec
+```
+
+Unauthenticated `PING` returned:
+
+```text
+NOAUTH Authentication required.
+```
+
+Authenticated `PING` returned:
+
+```text
+PONG
+```
+
+---
+
+## 9.4.2 Five Redis data structures
+
+I connected from a temporary Redis 8.10.1 client Pod.
+
+### STRING with TTL
+
+The first short 10-second test expired before the follow-up command, returning:
+
+```text
+TTL = -2
+```
+
+I repeated it with a 60-second TTL:
+
+```text
+SET product:SKU-001 "Mouse|electronics|199.00" EX 60
+GET -> Mouse|electronics|199.00
+TTL -> 47
+```
+
+After waiting 61 seconds:
+
+```text
+TTL -> -2
+GET -> nil
+```
+
+This proved expiry rather than only setting a TTL.
+
+### HASH — shopping cart
+
+```text
+HSET cart:customer-001 SKU-001 1 SKU-003 2
+```
+
+Result:
+
+```text
+SKU-001 -> 1
+SKU-003 -> 2
+```
+
+### LIST — job queue
+
+```text
+LPUSH jobs:email order:1001 order:1002
+```
+
+The list contained:
+
+```text
+order:1002
+order:1001
+```
+
+`BRPOP jobs:email 1` consumed:
+
+```text
+order:1001
+```
+
+### SET — unique visitors
+
+I added:
+
+```text
+customer-001
+customer-002
+customer-003
+customer-001
+```
+
+Redis reported only three unique additions and:
+
+```text
+SCARD visitors:SKU-001
+3
+```
+
+Members:
+
+```text
+customer-001
+customer-002
+customer-003
+```
+
+### ZSET — product leaderboard
+
+Scores:
+
+```text
+SKU-001 150
+SKU-003 120
+SKU-002 95
+SKU-004 60
+SKU-005 45
+```
+
+`ZREVRANGE ... WITHSCORES` returned the expected ranking.
+
+Type verification returned:
+
+```text
+cart        = hash
+queue       = list
+visitors    = set
+leaderboard = zset
+```
+
+---
+
+# 9.4.3 Persistence and AOF
+
+I wrote:
+
+```text
+persistence:proof = survives-redis-restart
+```
+
+and verified it before restart.
+
+### Trigger a save
+
+I explicitly ran:
+
+```text
+BGSAVE
+```
+
+Redis returned:
+
+```text
+Background saving started
+```
+
+Persistence status then showed:
+
+```text
+rdb_last_bgsave_status:ok
+aof_enabled:1
+aof_last_write_status:ok
+```
+
+The Redis PVC contained both RDB and AOF-related data:
+
+```text
+/data/dump.rdb
+
+/data/appendonlydir/
+  appendonly.aof.1.base.rdb
+  appendonly.aof.1.incr.aof
+  appendonly.aof.manifest
+```
+
+### Pod restart / persistence proof
+
+Before deletion:
+
+```text
+redis-0 Pod UID:
+70f83bc2-b21f-44d7-b69c-25e1d3b2d7c7
+
+PVC:
+redis-data-redis-0
+
+PV:
+pvc-2c555873-4c94-42ef-b8a8-eeba5585dece
+```
+
+I deleted `redis-0`.
+
+The StatefulSet recreated it with a new Pod UID:
+
+```text
+4daec710-f114-43ff-8f62-f0e2062183a1
+```
+
+The same PVC and PV remained bound.
+
+After recreation:
+
+```text
+GET persistence:proof
+survives-redis-restart
+```
+
+The shopping-cart hash also survived, and the top three leaderboard entries were still:
+
+```text
+SKU-001 150
+SKU-003 120
+SKU-002 95
+```
+
+AOF was still enabled.
+
+### RDB vs AOF
+
+RDB produces point-in-time snapshots. It is compact and fast to restore, but changes after the latest snapshot can be lost.
+
+AOF records write operations. It can reduce the potential data-loss window, at the cost of more write and storage overhead.
+
+`appendfsync everysec` is a durability/performance compromise. Redis normally flushes the AOF to stable storage approximately once per second rather than fsyncing every write. This avoids the much higher I/O cost of synchronous fsync on every write, but a sudden host/OS failure can lose roughly the most recent second of acknowledged writes that had not yet been durably flushed.
+
+For a disposable session cache, RDB or even no Redis persistence can be acceptable if authoritative state exists elsewhere. For a Redis-backed job queue, AOF is preferable because losing recent accepted jobs is more serious, although workloads needing strong delivery guarantees may be better served by a dedicated durable message broker.
+
+---
+
+# 9.4.4 Cache-aside pattern
+
+File:
+
+```text
+redis/cache-aside-notes.md
+```
+
+I demonstrated cache-aside with `SKU-002`.
+
+First, Redis had no cached value:
+
+```text
+DEL product:SKU-002 -> 0
+GET product:SKU-002 -> nil
+```
+
+I queried PostgreSQL:
+
+```text
+SKU-002|Keyboard|electronics|699.00
+```
+
+Then populated Redis:
+
+```text
+SET product:SKU-002 \
+    "SKU-002|Keyboard|electronics|699.00" \
+    EX 300
+```
+
+The next lookup returned the cached value and the observed TTL was:
+
+```text
+282
+```
+
+Flow:
+
+```text
+GET Redis
+  |
+  +-- hit  -> return cached value
+  |
+  +-- miss -> query PostgreSQL
+              |
+              +-> SET Redis with TTL
+              |
+              +-> return database result
+```
+
+Two documented failure modes:
+
+**Cache stampede** — a popular key expires and many clients query PostgreSQL simultaneously.
+Mitigation: request coalescing/distributed lock, prewarming, or randomized TTLs.
+
+**Stale data** — PostgreSQL is updated while Redis still contains an old value.
+Mitigation: invalidate/update the Redis key after a successful database write and use bounded TTLs.
+
+PostgreSQL remains the system of record.
+
+---
+
+# 9.4.5 Redis observation and security
+
+`INFO` returned:
+
+```text
+redis_version:          8.10.1
+redis_mode:             standalone
+used_memory:            978208
+used_memory_human:      955.28K
+used_memory_peak_human: 955.62K
+connected_clients:      1
+keyspace_hits:          5
+keyspace_misses:        1
+```
+
+Observed cache hit rate:
+
+```text
+5 / (5 + 1) = 83.3%
+```
+
+### Why Redis should not be exposed directly to the Internet
+
+Redis is a high-speed data service that can read and mutate application state. Direct Internet exposure unnecessarily increases the attack surface. Historically Redis was designed for trusted networks and did not always rely on authentication by default; even with modern authentication, a weak/leaked credential or permissive ACL could expose data or destructive commands.
+
+In production Redis should remain on private networking, use strong authentication/ACLs, enforce least privilege, rotate credentials, and avoid publishing port 6379 directly to the public Internet.
+
+### Network restriction
+
+I created:
+
+```text
+redis/redis-networkpolicy.yaml
+```
+
+which expresses the intended rule:
+
+```text
+only namespace shopstack -> Redis TCP/6379
+```
+
+However, the cluster uses vanilla Flannel, so I did not treat that manifest alone as effective enforcement.
+
+I added Istio injection to the Redis Pod and created:
+
+```text
+redis/redis-peer-authentication.yaml
+redis/redis-authorization-policy.yaml
+```
+
+Final Redis protection:
+
+```text
+PeerAuthentication: STRICT
+AuthorizationPolicy:
+  source namespace = shopstack
+  destination port = 6379
+```
+
+The Redis Pod became:
+
+```text
+redis-0   2/2 Running
+```
+
+A `shopstack` client with valid Redis credentials returned:
+
+```text
+PONG
+```
+
+and could read:
+
+```text
+persistence:proof
+survives-redis-restart
+```
+
+A mesh-enabled client in a separate `redis-deny-test` namespace used the **same valid Redis credentials** but received:
+
+```text
+I/O error
+Error: Server closed the connection
+exit code 1
+```
+
+The test namespace was deleted afterward.
+
+---
+
+# 9.4 Stretch — Redis Sentinel Failover
+
+Files:
+
+```text
+redis/sentinel-lab.yaml
+redis/sentinel-vs-cluster.md
+```
+
+## Topology
+
+I deployed three Redis data nodes with persistent PVCs:
+
+```text
+redis-ha-0
+redis-ha-1
+redis-ha-2
+```
+
+and three Sentinel Pods:
+
+```text
+redis-sentinel-ha-0
+redis-sentinel-ha-1
+redis-sentinel-ha-2
+```
+
+Each data node used a 1Gi `local-path` PVC.
+
+Initial replication:
+
+```text
+redis-ha-0  role=master  connected_slaves=2
+
+redis-ha-1  role=slave
+            master_host=redis-ha-0.data.svc.cluster.local
+            master_link_status=up
+
+redis-ha-2  role=slave
+            master_host=redis-ha-0.data.svc.cluster.local
+            master_link_status=up
+```
+
+All three Sentinels agreed on the initial primary, and:
+
+```text
+SENTINEL CKQUORUM mymaster
+OK 3 usable Sentinels. Quorum and failover authorization can be reached
+```
+
+Sentinel quorum was configured as:
+
+```text
+2
+```
+
+Other settings included:
+
+```text
+down-after-milliseconds = 5000
+failover-timeout        = 15000
+parallel-syncs          = 1
+```
+
+## Real failover drill
+
+I wrote:
+
+```text
+sentinel:failover-proof = written-before-primary-failure
+```
+
+to the primary and confirmed it had replicated to both replicas.
+
+I then deliberately removed the original primary and scaled:
+
+```text
+redis-ha-0 -> replicas=0
+```
+
+After Sentinel convergence:
+
+```text
+new master IP: 10.244.1.74
+redis-ha-1: role=master
+redis-ha-2: role=slave
+```
+
+Sentinel logs showed the full failover sequence:
+
+```text
++sdown
++odown              quorum 3/2
++try-failover
++elected-leader
++selected-slave
++promoted-slave
++switch-master
+```
+
+The proof key on the promoted master still returned:
+
+```text
+written-before-primary-failure
+```
+
+I restored `redis-ha-0`.
+
+It rejoined as a replica of the new master:
+
+```text
+redis-ha-0 role=slave  master_host=10.244.1.74
+redis-ha-1 role=master connected_slaves=2
+redis-ha-2 role=slave  master_host=10.244.1.74
+```
+
+Final quorum remained healthy:
+
+```text
+OK 3 usable Sentinels. Quorum and failover authorization can be reached
+```
+
+After the stretch evidence was complete, I scaled the three Redis HA Deployments and Sentinel StatefulSet to zero to release resources. Their three PVCs remained Bound.
+
+## Sentinel vs Redis Cluster
+
+**Redis Sentinel** provides high availability for a primary/replica topology. The whole dataset remains on one primary and is replicated to the replicas. Sentinel monitors health and coordinates promotion.
+
+**Redis Cluster** adds horizontal sharding. Redis hash slots are spread across multiple primaries, and each primary can have replicas. This increases total capacity and write throughput but requires cluster-aware clients and introduces resharding and multi-key operational complexity.
+
+For this lab, Sentinel was the better fit because the objective was failover, not horizontal Redis sharding.
+
+---
+
+# 9.5 Elasticsearch and Kibana with ECK
+
+## 9.5.1 Install ECK
+
+I added the official Elastic Helm repository and installed:
+
+```text
+release: elastic-operator
+chart:   eck-operator-3.5.0
+app:     3.5.0
+namespace: elastic-system
+```
+
+The operator became:
+
+```text
+elastic-operator-0   1/1 Running   k8s-worker-1
+```
+
+I initially assumed the Helm chart deployed a Deployment and ran:
+
+```bash
+kubectl rollout status deployment/elastic-operator \
+  -n elastic-system
+```
+
+Kubernetes returned:
+
+```text
+Error from server (NotFound): deployments.apps "elastic-operator" not found
+```
+
+I inspected the release and corrected the command to:
+
+```text
+statefulset/elastic-operator
+```
+
+The StatefulSet rollout completed successfully.
+
+### ECK CRDs
+
+The operator installed multiple Elastic CRDs, including:
+
+```text
+elasticsearches.elasticsearch.k8s.elastic.co
+kibanas.kibana.k8s.elastic.co
+agents.agent.k8s.elastic.co
+apmservers.apm.k8s.elastic.co
+beats.beat.k8s.elastic.co
+logstashes.logstash.k8s.elastic.co
+...
+```
+
+Both `Elasticsearch` and `Kibana` expose namespaced `v1` storage APIs.
+
+A CRD extends the Kubernetes API with an application-specific resource type. The ECK controller watches these custom resources and continuously reconciles lower-level objects such as Pods/StatefulSets, Services, Secrets, certificates, and configuration.
+
+---
+
+# Resource headroom before Elasticsearch
+
+Before scheduling Elasticsearch, the workers already carried workloads from Tasks 4 and 5.
+
+I recorded the exact baseline replicas in:
+
+```text
+/tmp/task6-pre-elasticsearch-replicas.txt
+```
+
+Saved ShopStack state:
+
+```text
+adservice                   1
+cartservice                 1
+checkoutservice             1
+currencyservice             1
+emailservice                1
+frontend                    3
+loadgenerator               1
+paymentservice              1
+productcatalogservice       1
+recommendationservice       1
+redis-cart                  1
+shippingservice             1
+shopstack-frontend-v1       1
+shopstack-frontend-v2       1
+
+helm-lab/shopstack-nginx-lab 2
+istio-system/prometheus      1
+```
+
+To create enough headroom for the memory-heavy Task 6 workloads, I scaled those live Deployments to zero.
+
+This was a **runtime capacity-management action**. It did not change their tracked manifests or erase their saved baseline.
+
+After scaling them down, worker requests fell to approximately:
+
+```text
+worker-1:
+  CPU requests    300m / 2 cores
+  Memory requests 572Mi
+
+worker-2:
+  CPU requests    320m / 2 cores
+  Memory requests 476Mi
+```
+
+PostgreSQL, Redis, and the Istio ingress gateway remained running.
+
+---
+
+# 9.5.2 Elasticsearch cluster
+
+File:
+
+```text
+elastic/elasticsearch.yaml
+```
+
+Final configuration:
+
+```text
+Elasticsearch version: 9.5.3
+name:                  shopstack
+namespace:             data
+NodeSets:              1
+node count:            1
+node:                  k8s-worker-2
+
+JVM:
+  -Xms2g
+  -Xmx2g
+
+requests:
+  cpu:    500m
+  memory: 2300Mi
+
+limits:
+  cpu:    2
+  memory: 3Gi
+
+PVC:
+  5Gi
+  ReadWriteOnce
+  local-path
+```
+
+`node.store.allow_mmap` was disabled for the lab.
+
+The ECK resource initially showed `ApplyingChanges`, then converged to:
+
+```text
+shopstack   green   1   9.5.3   Ready
+```
+
+The Elasticsearch Pod:
+
+```text
+shopstack-es-default-0
+1/1 Running
+node: k8s-worker-2
+```
+
+PVC:
+
+```text
+elasticsearch-data-shopstack-es-default-0
+5Gi
+Bound
+PV: pvc-3906be67-5494-4b23-9c30-bc7bc9f23a6e
+```
+
+The live JVM options were:
+
+```text
+-Xms2g -Xmx2g
+```
+
+### ECK-generated credentials
+
+ECK generated:
+
+```text
+data/shopstack-es-elastic-user
+key: elastic
+```
+
+I retrieved the password at runtime without storing it in the repository.
+
+This is safer than hard-coding a static password in the Elasticsearch CR, shell script, or Git history. Kubernetes RBAC can restrict Secret reads, and the credential is created as part of the ECK-managed resource lifecycle.
+
+The Secret still requires normal production protections such as least-privilege RBAC, encryption at rest, and rotation; Kubernetes Secret storage does not automatically make a credential safe.
+
+The Elasticsearch API confirmed:
+
+```text
+cluster_name: shopstack
+version:      9.5.3
+```
+
+One command attempted to pipe to `jq` **inside** the Elasticsearch container and failed:
+
+```text
+sh: jq: command not found
+exit code 127
+```
+
+I therefore used local `jq` or a separate curl client Pod rather than modifying the Elasticsearch image.
+
+---
+
+# 9.5.3 Products index and search
+
+Final repository files:
+
+```text
+elastic/products-mapping.json
+elastic/products-bulk.ndjson
+elastic/query-fuzzy.json
+elastic/query-bool.json
+elastic/query-aggregation.json
+```
+
+## Mapping correction
+
+My first mapping used:
+
+```text
+name
+```
+
+as the text field.
+
+The task specifically requires:
+
+```text
+title
+```
+
+with a keyword sub-field.
+
+Rather than leaving a near-match, I corrected the repository files, deleted the temporary `products` index, recreated it, and re-indexed all documents.
+
+The final mapping contains:
+
+```text
+sku          keyword
+title        text + title.keyword
+description  text
+category     keyword
+price        double
+stock        integer
+```
+
+Index settings:
+
+```text
+number_of_shards:   1
+number_of_replicas: 1
+```
+
+## Bulk indexing
+
+`elastic/products-bulk.ndjson` contains 20 NDJSON lines:
+
+```text
+10 action lines
+10 document lines
+```
+
+All lines validated as JSON.
+
+The final `_bulk` operation returned:
+
+```text
+errors:  false
+indexed: 10
+```
+
+Final count:
+
+```text
+10
+```
+
+## Fuzzy query
+
+Query typo:
+
+```text
+keybord
+```
+
+with:
+
+```text
+fuzziness: AUTO
+```
+
+Result:
+
+```text
+total_hits: 1
+
+SKU-002
+Keyboard
+699.00
+```
+
+## Bool query: `match` + `range`
+
+The final bool query combines:
+
+```text
+must:
+  match title = keyboard
+
+filter:
+  price between 200 and 800
+```
+
+Result:
+
+```text
+total_hits: 1
+
+SKU-002
+Keyboard
+699.00
+```
+
+## Aggregation
+
+The final category aggregation returned:
+
+```text
+electronics  5
+accessories  3
+lifestyle    2
+```
+
+The aggregation file also calculates average price per category.
+
+---
+
+# 9.5.4 Kibana through Istio
+
+File:
+
+```text
+elastic/kibana.yaml
+```
+
+Repository desired state:
+
+```text
+Kibana version: 9.5.3
+count:          1
+Elasticsearch:  shopstack
+node:           k8s-worker-1
+
+requests:
+  cpu:    200m
+  memory: 512Mi
+
+limits:
+  cpu:    1
+  memory: 1Gi
+```
+
+For the internal service, the ECK self-signed HTTP certificate was disabled so the Istio HTTP route could terminate at Kibana over cluster HTTP.
+
+The initial Kibana Pod became:
+
+```text
+shopstack-kb-74b8454795-4wxgc
+1/1 Running
+k8s-worker-1
+```
+
+Kibana health:
+
+```text
+green
+nodes: 1
+```
+
+Service:
+
+```text
+shopstack-kb-http
+ClusterIP
+5601/TCP
+```
+
+An internal curl returned:
+
+```text
+HTTP 200
+```
+
+## Istio exposure
+
+I reused the existing Task 5 Gateway rather than creating another ingress stack.
+
+`istio/gateway.yaml` was extended with:
+
+```text
+kibana.shopstack.local
+```
+
+and I created:
+
+```text
+istio/kibana-virtualservice.yaml
+```
+
+Destination:
+
+```text
+shopstack-kb-http.data.svc.cluster.local:5601
+```
+
+The existing `shopstack.local` route and 90/10 canary VirtualService were left intact.
+
+The Istio ingress gateway HTTP NodePort was:
+
+```text
+32442
+```
+
+I created the MacBook tunnel:
+
+```bash
+ssh -fN \
+  -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:18080:10.10.0.10:32442 \
+  k8s-cp
+```
+
+Host-header verification returned:
+
+```text
+HTTP/1.1 200 OK
+```
+
+for:
+
+```text
+Host: kibana.shopstack.local
+```
+
+I added:
+
+```text
+127.0.0.1 kibana.shopstack.local
+```
+
+to `/etc/hosts`, flushed the macOS DNS cache, and verified:
+
+```text
+http://kibana.shopstack.local:18080/login
+HTTP 200
+```
+
+The ECK `elastic` password was copied to the clipboard for the interactive login.
+
+The required Dev Tools evidence was saved as:
+
+```text
+docs/evidence/task6/kibana-dev-tools-products-query.png
+```
+
+The terminal audit confirms the screenshot file exists in the repository evidence directory.
+
+---
+
+# 9.5.5 Cluster health, shards, snapshot procedure, and ILM
+
+## Cluster health
+
+After Kibana/system indices existed, `_cluster/health` returned:
+
+```text
+cluster_name:          shopstack
+status:                yellow
+number_of_nodes:       1
+active_primary_shards: 53
+active_shards:         53
+unassigned_shards:     1
+```
+
+For the `products` index:
+
+```text
+primary shard:
+  STARTED
+  docs: 10
+
+replica shard:
+  UNASSIGNED
+```
+
+Allocation explain returned:
+
+```text
+can_allocate: no
+decider:      same_shard
+decision:     NO
+```
+
+Reason:
+
+```text
+a copy of this shard is already allocated to this node
+```
+
+The `products` index is configured with one primary and one replica, but the Elasticsearch cluster contains only one node. Elasticsearch will not place a replica on the same node as its primary, so the primary remains available while the replica is unassigned.
+
+That is why this single-node lab is `yellow` rather than `green`.
+
+A **shard** is a horizontal unit of an Elasticsearch index. A **replica** is another copy of a primary shard that provides redundancy and can also contribute read capacity when another suitable node exists.
+
+## Snapshot runbook
+
+I did not create a second temporary object-storage system solely for Task 6.
+
+Task 7 is responsible for MinIO and the `shopstack-backups` object-storage bucket, so I documented the exact Elasticsearch-to-S3-compatible procedure in:
+
+```text
+runbooks/elasticsearch-snapshot.md
+```
+
+The 224-line runbook covers:
+
+```text
+ECK secureSettings
+MinIO / S3-compatible credentials
+repository name: shopstack-backups
+bucket:          shopstack-backups
+_snapshot repository registration
+_verify
+snapshot creation with wait_for_completion
+snapshot listing
+restore
+recovery monitoring
+products/_count verification
+```
+
+Expected post-restore `products` count:
+
+```text
+10
+```
+
+The runbook also documents that snapshots must live outside the Elasticsearch data PVC and that snapshots protect recoverability while replicas protect availability.
+
+## ILM
+
+File:
+
+```text
+elastic/ilm-notes.md
+```
+
+ILM is appropriate for continuously growing time-series/log-style data such as:
+
+```text
+application logs
+access logs
+audit events
+infrastructure logs
+metrics
+```
+
+A typical lifecycle can keep recent data hot, roll over by size/age, move older data to cheaper tiers, and delete data after the required retention period.
+
+The ShopStack `products` index is application state, not disposable log data, so age-based deletion would be inappropriate. Snapshot/restore and application-controlled updates are more relevant for that index.
+
+---
+
+# 9.5.6 Resource discipline and Metrics Server
+
+The cluster initially had no Metrics API:
+
+```text
+kubectl get apiservice v1beta1.metrics.k8s.io
+NotFound
+```
+
+and:
+
+```text
+kubectl top ...
+error: Metrics API not available
+```
+
+I downloaded the official Metrics Server v0.9.0 manifest:
+
+```text
+registry.k8s.io/metrics-server/metrics-server:v0.9.0
+```
+
+Downloaded manifest SHA-256:
+
+```text
+1cec29a5267809306a2c6ec74a3e449abbb705b4a8beed0c8a1963910f72c79b
+```
+
+The installation created the APIService, Service, RBAC, and Deployment, but the Deployment remained:
+
+```text
+0/1
+```
+
+and readiness timed out.
+
+Metrics Server logs showed the actual cause on all three nodes:
+
+```text
+tls: failed to verify certificate:
+x509: cannot validate certificate for 10.10.0.x
+because it doesn't contain any IP SANs
+```
+
+The kubelet serving certificates did not contain the node InternalIP addresses as SANs.
+
+For this lab only, I patched Metrics Server with:
+
+```text
+--kubelet-insecure-tls
+```
+
+The rollout then completed:
+
+```text
+metrics-server   1/1 Running
+```
+
+and the APIService became:
+
+```text
+AVAILABLE=True
+```
+
+`kubectl top` then worked.
+
+This is a lab workaround, not a production recommendation. It keeps HTTPS but disables kubelet serving-certificate verification. In production I would issue trusted kubelet serving certificates with the correct node IP SANs and remove this flag.
+
+## Actual observed usage
+
+First working sample:
+
+| Resource | CPU | Memory |
+|---|---:|---:|
+| `k8s-cp` | 183m | 1270Mi |
+| `k8s-worker-1` | 160m | 1828Mi |
+| `k8s-worker-2` | 134m | 3248Mi |
+| Elasticsearch | 43m | 2696Mi |
+| Kibana | 28m | 908Mi |
+
+A later sample showed:
+
+```text
+Elasticsearch  43m   2697Mi
+Kibana         29m    925Mi
+PostgreSQL     24m     71Mi
+Redis          12m     45Mi
+```
+
+Worker 2 was around 84–85% memory utilization while Elasticsearch was running.
+
+Resource notes were saved in:
+
+```text
+elastic/resource-discipline.md
+```
+
+### Elasticsearch heap rule
+
+The Final Run uses:
+
+```text
+-Xms2g -Xmx2g
+container limit = 3Gi
+```
+
+The JVM heap is therefore approximately:
+
+```text
+2 / 3 = 66.7%
+```
+
+That is higher than the common production rule of thumb of keeping Elasticsearch heap around 50% of the memory available to the process.
+
+The remaining memory is needed for JVM native memory, direct buffers, Lucene/native structures, memory-mapped/file-backed data, and the filesystem cache.
+
+The lab intentionally keeps the required approximately 4Gi worker VM size. I did not increase VM RAM just to achieve an ideal ratio. For a production-style 2Gi heap, roughly 4Gi or more of container memory plus node headroom would be more appropriate.
+
+---
+
+# 9.6 NebulaGraph
+
+## 9.6.1 Nebula Operator
+
+I added the required official repository:
+
+```bash
+helm repo add nebula-operator \
+  https://vesoft-inc.github.io/nebula-operator/charts
+```
+
+Latest chart selected during the run:
+
+```text
+chart version: 1.8.8
+appVersion:    1.8.8
+```
+
+I installed the operator into:
+
+```text
+nebula-system
+```
+
+Helm returned one warning:
+
+```text
+Warning: tls: failed to find any PEM data in certificate input
+```
+
+but the release completed:
+
+```text
+STATUS: deployed
+REVISION: 1
+```
+
+Running operator Pods included two controller-manager Pods and two scheduler Pods across the two workers.
+
+One important verification was that the actual container image shipped by this chart was:
+
+```text
+vesoft/nebula-operator:v1.8.7
+```
+
+even though the Helm chart and `appVersion` were `1.8.8`.
+
+This is a useful operational lesson: chart version, `appVersion`, and actual image tag should be inspected rather than assumed to be identical.
+
+Installed CRDs included:
+
+```text
+NebulaCluster
+NebulaBackup
+NebulaCronBackup
+NebulaRestore
+NebulaAutoscaler
+```
+
+The `NebulaCluster` CRD served/stored:
+
+```text
+v1alpha1
+```
+
+---
+
+## Operator vs hand-written StatefulSet
+
+A Kubernetes operator combines CRDs with an application-aware reconciliation loop.
+
+### Operator advantages
+
+1. It exposes database-level desired state rather than forcing the user to manually manage every low-level Kubernetes resource.
+2. It automates application-specific lifecycle behavior such as component creation, topology reconciliation, and scaling.
+
+### Operator risk
+
+The controller and CRDs become another dependency. An operator bug, version mismatch, bad reconciliation decision, or CRD compatibility problem can affect the database lifecycle.
+
+### Hand-written StatefulSet advantages
+
+1. The Kubernetes resources are explicit and easier to inspect directly.
+2. There is no extra application-specific controller required for basic Pod/PVC lifecycle.
+
+### Hand-written StatefulSet risk
+
+Kubernetes understands the Pod/storage lifecycle but not the database protocol. Failover, topology changes, upgrades, and database-specific coordination must be implemented and operated manually.
+
+PostgreSQL in 9.1 therefore demonstrated the hand-managed model; ECK and Nebula Operator demonstrated operator-managed state.
+
+---
+
+# 9.6.2 NebulaCluster
+
+Before writing the CR I inspected the installed schema with `kubectl explain`.
+
+The CRD confirmed:
+
+```text
+metad.dataVolumeClaim
+storaged.dataVolumeClaims
+graphd has no main graph-data claim field
+```
+
+File:
+
+```text
+nebula/nebula-cluster.yaml
+```
+
+Initial topology:
+
+```text
+graphd:
+  replicas: 1
+  image: vesoft/nebula-graphd:v3.8.0
+
+metad:
+  replicas: 1
+  image: vesoft/nebula-metad:v3.8.0
+  PVC: 2Gi local-path
+
+storaged:
+  replicas: 1
+  image: vesoft/nebula-storaged:v3.8.0
+  PVC: 2Gi local-path
+  enableAutoBalance: true
+```
+
+All three components were pinned to:
+
+```text
+k8s-worker-1
+```
+
+to keep them away from the memory-heavy Elasticsearch node on worker 2.
+
+Initial reconciliation:
+
+```text
+NebulaCluster shopstack-nebula
+READY=True
+
+graphd desired/ready:   1/1
+metad desired/ready:    1/1
+storaged desired/ready: 1/1
+```
+
+Pods:
+
+```text
+shopstack-nebula-graphd-0     1/1 Running
+shopstack-nebula-metad-0      1/1 Running
+shopstack-nebula-storaged-0   1/1 Running
+```
+
+PVCs:
+
+```text
+metad-data-shopstack-nebula-metad-0
+  2Gi
+  Bound
+  PV pvc-2540e183-e7e6-42a2-8a87-a0f34b2f326b
+
+storaged-data-shopstack-nebula-storaged-0
+  2Gi
+  Bound
+  PV pvc-89b91de9-0b45-4284-a788-29755cbf1a7d
+```
+
+`graphd` exposed:
+
+```text
+9669
+19669
+```
+
+Initially, before the graph space existed, `SHOW HOSTS` showed the one storaged host `ONLINE` but with no valid partition.
+
+---
+
+# 9.6.3 Graph schema and data
+
+Files:
+
+```text
+nebula/schema.ngql
+nebula/sample-data.ngql
+```
+
+Space:
+
+```text
+shopstack
+partition_num = 1
+replica_factor = 1
+vid_type = FIXED_STRING(32)
+```
+
+Tags:
+
+```text
+product(name, category, price)
+customer(name)
+```
+
+Edges:
+
+```text
+browsed()
+bought(quantity)
+```
+
+Products:
+
+```text
+p001 Mouse        electronics 199
+p002 Keyboard     electronics 699
+p003 USB Hub      electronics 329
+p004 Laptop Stand accessories 249
+p005 Bottle       lifestyle   129
+```
+
+Customers:
+
+```text
+c001 Gerald
+c002 Pei
+c003 Mia
+```
+
+Bought edges:
+
+```text
+c001 -> p001
+c001 -> p002
+c001 -> p003
+c002 -> p001
+c002 -> p004
+c003 -> p001
+c003 -> p005
+```
+
+Browsed edges:
+
+```text
+c001 -> p004
+c002 -> p002
+c003 -> p003
+```
+
+## Multiline nGQL problem
+
+The first `sample-data.ngql` file formatted one `INSERT` across several physical lines.
+
+When the entire file was passed to:
+
+```text
+nebula-console -e
+```
+
+the console treated the physical lines as separate commands.
+
+The first line:
+
+```text
+INSERT VERTEX ... VALUES
+```
+
+was therefore executed before its value rows and returned syntax errors. The following value lines also failed individually.
+
+I did not reset the space.
+
+I rewrote each complete `INSERT` statement onto one physical line. The second run succeeded for:
+
+```text
+product vertices
+customer vertices
+bought edges
+browsed edges
+```
+
+Final verification showed:
+
+```text
+SHOW TAGS:
+customer
+product
+
+SHOW EDGES:
+bought
+browsed
+```
+
+and all five products / three customers could be queried.
+
+---
+
+# 9.6.4 Required nGQL queries
+
+File:
+
+```text
+nebula/queries.ngql
+```
+
+## A. Products bought by one customer
+
+For `c001 / Gerald`:
+
+```text
+Mouse      199
+Keyboard   699
+USB Hub    329
+```
+
+## B. 2-hop recommendation
+
+Pattern:
+
+```text
+product <- bought - customer - bought -> other product
+```
+
+Starting from:
+
+```text
+p001 / Mouse
+```
+
+the query returned four distinct products:
+
+```text
+p005 Bottle
+p004 Laptop Stand
+p002 Keyboard
+p003 USB Hub
+```
+
+## C. Most-bought product
+
+Counts:
+
+```text
+Mouse        3
+USB Hub      1
+Laptop Stand 1
+Keyboard     1
+Bottle       1
+```
+
+Therefore `p001 / Mouse` was the most-bought product in the sample graph.
+
+## nGQL vs SQL vs openCypher/GQL
+
+SQL is table-oriented. Relationships are normally represented with foreign keys and traversed through joins.
+
+nGQL is graph-oriented: vertices, tags, edges, and traversals are first-class concepts. A multi-hop pattern can be represented directly rather than manually composing relational joins.
+
+The `MATCH` syntax is conceptually similar to openCypher/GQL pattern matching, but nGQL still has its own syntax and semantic rules.
+
+One example from this lab was:
+
+```text
+ORDER BY id(p)
+```
+
+which returned:
+
+```text
+SemanticError: Only column name can be used as sort item
+```
+
+I corrected it by aliasing the expression:
+
+```text
+RETURN id(p) AS product_id, ...
+ORDER BY product_id
+```
+
+The corrected query returned all five products.
+
+---
+
+# 9.6.5 Distributed architecture, scale, and persistence
+
+## Component roles
+
+### graphd
+
+`graphd` is the client-facing query / compute layer. It accepts nGQL on port 9669, plans queries, and coordinates execution.
+
+### metad
+
+`metad` stores cluster metadata and control information such as spaces, schemas, topology, and partition metadata. It is persistent and used a PVC in this lab.
+
+### storaged
+
+`storaged` stores the actual graph partitions containing vertices and edges. It is the main persistent data layer and used PVC-backed storage.
+
+Summary:
+
+```text
+graphd     query/compute            no main graph-data PVC
+metad      metadata/control state   persistent
+storaged   graph data               persistent
+```
+
+## Scale storaged 1 -> 2
+
+I edited the tracked `NebulaCluster` CR:
+
+```text
+storaged replicas: 1 -> 2
+```
+
+After applying it, the operator reconciled:
+
+```text
+GRAPHD  1/1
+METAD   1/1
+STORAGED 2/2
+READY=True
+```
+
+The second storage Pod appeared:
+
+```text
+shopstack-nebula-storaged-1
+```
+
+with a new 2Gi PVC:
+
+```text
+storaged-data-shopstack-nebula-storaged-1
+PV: pvc-8d360bfc-6ed4-4228-844f-cfcf82fdf742
+```
+
+`SHOW HOSTS` showed both storage hosts ONLINE.
+
+Because the existing space was created with:
+
+```text
+partition_num = 1
+replica_factor = 1
+```
+
+the original `storaged-0` remained leader for:
+
+```text
+shopstack:1
+```
+
+while `storaged-1` correctly showed:
+
+```text
+No valid partition
+```
+
+Adding a storage process does not retroactively change the space replication factor.
+
+## Delete storaged Pod and prove persistence
+
+Before deletion:
+
+```text
+Pod:
+shopstack-nebula-storaged-0
+
+Pod UID:
+d45c5a66-d20f-4b4f-845a-0d35d510ea00
+
+PVC UID:
+89b91de9-0b45-4284-a788-29755cbf1a7d
+
+PV:
+pvc-89b91de9-0b45-4284-a788-29755cbf1a7d
+
+PV UID:
+fbadb698-5463-4231-a54a-84b42ee5c859
+```
+
+I deleted the Pod.
+
+After operator/StatefulSet recreation:
+
+```text
+new Pod UID:
+06ed6ba2-9890-4c7f-9630-b4d184176b16
+```
+
+The PVC UID, PV name, and PV UID were unchanged.
+
+`SHOW HOSTS` returned both storaged hosts ONLINE, and:
+
+```text
+SHOW SPACES
+```
+
+still returned:
+
+```text
+shopstack
+```
+
+A product-level query then returned all five persisted products:
+
+```text
+p001 Mouse
+p002 Keyboard
+p003 USB Hub
+p004 Laptop Stand
+p005 Bottle
+```
+
+This demonstrated that the Pod object was replaceable while state remained on the PVC/PV.
+
+---
+
+# 9.6.6 NebulaGraph BR backup runbook
+
+File:
+
+```text
+runbooks/nebula-backup.md
+```
+
+The 286-line runbook documents the Community NebulaGraph BR workflow using the MinIO object store that Task 7 will provide.
+
+The documented target is:
+
+```text
+bucket: shopstack-backups
+prefix: nebula/
+```
+
+The runbook covers:
+
+```text
+BR prerequisites
+nebula-agent requirement
+SHOW HOSTS
+SHOW SPACES
+MinIO / S3-compatible credentials
+br backup full
+br show
+object verification
+offline/disruptive restore preparation
+br restore full
+post-restore service verification
+post-restore graph queries
+backup cleanup and retention
+```
+
+The procedure treats restore as an offline/disruptive maintenance operation.
+
+Final service checks showed:
+
+```text
+SHOW HOSTS:
+storaged-0 ONLINE
+storaged-1 ONLINE
+
+SHOW SPACES:
+shopstack
+```
+
+---
+
+# 9.6 Stretch — NebulaGraph Studio
+
+File:
+
+```text
+nebula/studio.yaml
+```
+
+The Studio workload was:
+
+```text
+image:     vesoft/nebula-graph-studio:v3.10.0
+namespace: data
+replicas:  1
+node:      k8s-worker-1
+port:      7001
+Service:   ClusterIP
+```
+
+Resources:
+
+```text
+requests:
+  cpu: 50m
+  memory: 128Mi
+
+limits:
+  cpu: 500m
+  memory: 512Mi
+```
+
+The Deployment rolled out successfully:
+
+```text
+nebula-studio   1/1 Running
+```
+
+An in-cluster curl returned:
+
+```text
+HTTP 200
+```
+
+## Istio exposure
+
+I extended the existing Gateway with:
+
+```text
+studio.shopstack.local
+```
+
+and created:
+
+```text
+istio/nebula-studio-virtualservice.yaml
+```
+
+Destination:
+
+```text
+nebula-studio.data.svc.cluster.local:7001
+```
+
+### Dry-run caught an indentation error
+
+The first script inserted:
+
+```text
+studio.shopstack.local
+```
+
+with four spaces instead of eight.
+
+Server-side dry-run rejected the Gateway:
+
+```text
+spec.servers[1] ... must be of type object: "string"
+```
+
+Because I tested with `--dry-run=server`, the invalid Gateway never replaced the working live resource.
+
+I corrected the indentation, repeated the dry-run successfully, and then applied the files.
+
+Final Gateway hosts:
+
+```text
+shopstack.local
+kibana.shopstack.local
+studio.shopstack.local
+```
+
+Final VirtualServices:
+
+```text
+shopstack
+kibana
+nebula-studio
+```
+
+Using the same ingress NodePort tunnel, Host-header access returned:
+
+```text
+HTTP 200
+```
+
+I added:
+
+```text
+127.0.0.1 studio.shopstack.local
+```
+
+to `/etc/hosts`, flushed DNS, and the hostname request also returned:
+
+```text
+HTTP 200
+```
+
+The Studio evidence screenshot was saved as:
+
+```text
+docs/evidence/task6/nebula-studio-shopstack-graph.png
+```
+
+The terminal audit confirms the screenshot exists.
+
+---
+
+# End-of-Task Resource Management
+
+The required VM sizing remained unchanged at approximately 2 vCPU / 4 GiB per node.
+
+The Task 6 data stores and operators pushed CPU requests and memory utilization close to the capacity of the small lab workers.
+
+At the end of the recorded session, worker 1 showed:
+
+```text
+CPU requests:    1850m / 2000m = 92%
+Memory requests: 3200Mi        = 84%
+```
+
+Worker 2 was using approximately:
+
+```text
+3318Mi = 87%
+```
+
+of memory by `kubectl top`.
+
+## Attempt to bring Kibana back while Studio was running
+
+I changed the live Kibana CR back to:
+
+```text
+count: 1
+```
+
+but the new Kibana Pod remained `Pending`.
+
+Scheduler event:
+
+```text
+0/3 nodes are available:
+1 Insufficient cpu,
+1 node did not match the Pod nodeSelector,
+1 node had an untolerated taint
+```
+
+The Kibana Pod required:
+
+```text
+nodeSelector: k8s-worker-1
+main container request: 200m CPU / 512Mi
+init container request: 100m CPU / 50Mi
+```
+
+I scaled the live Nebula Studio Deployment to zero to free its `50m` request, but Kibana still did not schedule within the next 300 seconds.
+
+I therefore returned the live Kibana CR to:
+
+```text
+count: 0
+```
+
+Final verification:
+
+```text
+kubectl get pod \
+  -n data \
+  -l kibana.k8s.elastic.co/name=shopstack
+
+No resources found in data namespace.
+```
+
+Nebula Studio was also left at live replica count `0`.
+
+### Repository desired state was preserved
+
+The tracked manifests were **not** changed to zero:
+
+```text
+elastic/kibana.yaml:
+  version: 9.5.3
+  count: 1
+
+nebula/studio.yaml:
+  replicas: 1
+
+nebula/nebula-cluster.yaml:
+  graphd:    1
+  metad:     1
+  storaged:  2
+```
+
+Therefore the repository still describes the deployable Task 6 configuration. Scaling the completed UI components down was a runtime capacity decision, not a reduction of the deliverable.
+
+Earlier Task 4/5 application Deployments had also been scaled down live after their original replica counts were captured in `/tmp/task6-pre-elasticsearch-replicas.txt`. Their tracked manifests were not changed by that runtime scaling.
+
+---
+
+# Troubleshooting Notes
+
+## Kubernetes API SSH tunnel repeatedly expired
+
+The local kubeconfig points to:
+
+```text
+https://127.0.0.1:6443
+```
+
+so when the SSH forward ended, commands failed with either:
+
+```text
+connection refused
+```
+
+or:
+
+```text
+TLS handshake timeout
+```
+
+At one point a stale listener still occupied TCP/6443:
+
+```text
+bind [127.0.0.1]:6443: Address already in use
+```
+
+`lsof` showed the SSH PID, but the process disappeared before `kill` could act on it.
+
+I did not reset kubeadm or expose the API publicly. I checked the listener state and recreated only the existing SSH forward when required.
+
+## PostgreSQL role password quoting
+
+The first `CREATE ROLE` attempt using a `psql -c` command plus `:'reporting_password'` failed with a syntax error.
+
+I verified that the role had not been created, kept the generated password, and changed to stdin-fed SQL. The second attempt succeeded.
+
+## PostgreSQL backup namespace changed after access-control design
+
+The first CronJob in `data` worked, but the final PostgreSQL policy only allows `shopstack`.
+
+I moved the tracked backup CronJob/PVC to `shopstack`, used the FQDN for PostgreSQL, and verified the new Job received an Istio sidecar and still completed.
+
+This aligned the backup workload with the final namespace authorization model.
+
+## Redis command paste contained terminal bracketed-paste characters
+
+One pasted command started with:
+
+```text
+[200~kubectl
+```
+
+and zsh returned:
+
+```text
+bad pattern
+```
+
+No cluster object changed. I re-ran the intended command cleanly.
+
+## ECK operator was a StatefulSet, not a Deployment
+
+I initially used:
+
+```text
+kubectl rollout status deployment/elastic-operator
+```
+
+and received `NotFound`.
+
+Inspection showed the Helm chart had deployed a StatefulSet. Using:
+
+```text
+statefulset/elastic-operator
+```
+
+was correct.
+
+## Elasticsearch container did not include `jq`
+
+A command attempted to pipe Elasticsearch API output to `jq` inside the Elasticsearch container:
+
+```text
+sh: jq: command not found
+```
+
+I did not install extra packages into the database container. I moved JSON processing outside the container / into the temporary curl client workflow.
+
+## Elasticsearch mapping was corrected from `name` to `title`
+
+The first products mapping worked technically but used the field name `name`.
+
+Because the task explicitly requires `title` as text with a keyword sub-field, I corrected the mapping and data files, deleted the temporary index, recreated it, and repeated indexing/search validation.
+
+The final repository and final query evidence use `title`.
+
+## Metrics Server certificate failure
+
+The official Metrics Server Pod was Running but NotReady and the APIService had no usable metrics.
+
+Logs showed that every kubelet serving certificate lacked the node-IP SAN.
+
+The lab-only `--kubelet-insecure-tls` patch resolved it. In production this flag should be removed after issuing trusted kubelet serving certificates with the correct SANs.
+
+## Nebula multiline `INSERT` statements
+
+`nebula-console -e` treated multiline physical statements as separate commands and produced syntax errors around `VALUES` and the value rows.
+
+I rewrote each full `INSERT` onto one physical line. The corrected script loaded all graph data without deleting/recreating the space.
+
+## Nebula `ORDER BY` expression
+
+This query failed:
+
+```text
+ORDER BY id(p)
+```
+
+with:
+
+```text
+Only column name can be used as sort item
+```
+
+I aliased the expression and sorted by the alias:
+
+```text
+RETURN id(p) AS product_id, ...
+ORDER BY product_id
+```
+
+The corrected query returned all five persisted products.
+
+## Nebula Studio Gateway indentation
+
+A script inserted the Studio host at the wrong YAML indentation.
+
+Server-side dry-run rejected it before it could affect the live Gateway.
+
+After correcting the host to align with the existing host list, both dry-run and live apply succeeded.
+
+## Final Kibana scheduling failure was capacity-related
+
+The final Kibana Pod did not crash. It never scheduled.
+
+`kubectl describe` showed:
+
+```text
+Insufficient cpu
+```
+
+on its required worker.
+
+This was a scheduler-capacity issue caused by accumulated Task 6 workload requests on fixed-size 4Gi/2-vCPU nodes. I kept the required VM sizing and scaled the already-evidenced UI component down rather than increasing lab resources.
+
+---
+
+# Checkpoint Questions
+
+## 1. What is the difference between a logical backup (`pg_dump`) and a physical backup (base backup / WAL archiving)? When would you need point-in-time recovery?
+
+A logical backup exports SQL-level database objects and rows. `pg_dump` is portable and convenient for selective recovery or migration, but restoring a very large logical dump can be slow.
+
+A physical backup captures the PostgreSQL data representation and is normally paired with WAL archiving. It is more appropriate for whole-cluster disaster recovery and is the foundation for point-in-time recovery.
+
+Point-in-time recovery is needed when the required target is a specific moment, for example immediately before an accidental destructive update or table drop. I would restore a base backup and replay WAL only up to the selected recovery target.
+
+---
+
+## 2. Why does a StatefulSet Pod keep the same name and storage after rescheduling?
+
+A StatefulSet gives each replica a stable ordinal identity such as:
+
+```text
+postgres-0
+shopstack-nebula-storaged-0
+```
+
+A `volumeClaimTemplate` creates a stable PVC associated with that ordinal. Deleting/recreating the Pod produces a new Pod UID, but the same ordinal is recreated and it mounts the same PVC.
+
+The Nebula persistence drill demonstrated this directly: the storaged Pod UID changed while the PVC UID and PV UID remained unchanged.
+
+---
+
+## 3. What risks come with putting database passwords in environment variables, and what are the alternatives?
+
+Environment variables are easy to use but can leak through debugging output, accidental logging, process/container inspection, crash diagnostics, shell history, or overly broad permissions to Pod specifications.
+
+Kubernetes Secrets separate the credential from the application manifest, but their base64 API representation is not encryption by itself.
+
+Production controls should include:
+
+- least-privilege RBAC;
+- encryption at rest;
+- credential rotation;
+- external secret managers such as Vault or cloud secret services;
+- mounted secret files or controlled secret injection where appropriate;
+- never committing real credentials to Git.
+
+---
+
+## 4. For each data store, name one workload it is right for and one it is wrong for. Why not use PostgreSQL for everything?
+
+### PostgreSQL
+
+Good fit:
+
+```text
+transactional business data, orders, users, inventory, relational records
+```
+
+Poor fit:
+
+```text
+very high-volume ephemeral cache lookups
+```
+
+### Redis
+
+Good fit:
+
+```text
+cache, session data, counters, rate limits, short-lived queues/leaderboards
+```
+
+Poor fit:
+
+```text
+authoritative relational OLTP data with complex integrity constraints
+```
+
+### Elasticsearch
+
+Good fit:
+
+```text
+full-text search, fuzzy matching, relevance ranking, log search, aggregations
+```
+
+Poor fit:
+
+```text
+ACID relational transactions and referential-integrity-heavy OLTP
+```
+
+### NebulaGraph
+
+Good fit:
+
+```text
+relationship-heavy recommendations, fraud graphs, social/network traversals
+```
+
+Poor fit:
+
+```text
+simple CRUD entities with shallow relationships where SQL is already natural
+```
+
+PostgreSQL can implement many things, but forcing every workload into one engine can make caching, full-text relevance, or deep relationship traversal unnecessarily inefficient or complex. Additional stores are justified only when their workload advantage is worth their operational cost.
+
+---
+
+## 5. Redis RDB vs AOF: which would you choose for a session store, and which for a job queue? Why?
+
+RDB creates periodic snapshots. It is compact and fast to restore, but writes after the latest snapshot can be lost.
+
+AOF records write commands and can provide a much smaller data-loss window. With `appendfsync everysec`, Redis trades approximately one second of possible recent-write loss for much better write performance than fsyncing every command.
+
+For a disposable/reconstructable session cache, RDB or no persistence may be acceptable.
+
+For a Redis-based job queue, I would prefer AOF because recent accepted jobs are more important to preserve. If the workload needs strict delivery guarantees, I would consider a dedicated durable queue instead.
+
+---
+
+## 6. Why is a single-node Elasticsearch cluster `yellow`, and what do shards and replicas do?
+
+`yellow` means all primary shards are allocated, but one or more replicas are not.
+
+The Final Run `products` index had:
+
+```text
+1 primary
+1 replica
+1 Elasticsearch node
+```
+
+The primary was `STARTED`; the replica was `UNASSIGNED`.
+
+Allocation explain returned the `same_shard` decider because Elasticsearch will not place a replica on the same node that already owns the primary copy.
+
+Shards partition index data. Replicas are additional copies of primary shards that provide redundancy and can also serve reads when another node is available.
+
+---
+
+## 7. When is a graph database the right tool over a relational one — and when is it overkill?
+
+A graph database is useful when relationships themselves are central to the workload and queries frequently traverse multiple hops, for example:
+
+```text
+recommendations
+fraud rings
+social relationships
+network topology
+dependency graphs
+```
+
+It is overkill when the workload is mostly straightforward entities with shallow relationships and ordinary CRUD/filtering/aggregation. In that case PostgreSQL is usually simpler to operate and easier for most teams to maintain.
+
+---
+
+## 8. What do graphd, metad, and storaged each do, and which hold persistent state?
+
+```text
+graphd:
+  query-facing compute layer
+  accepts/plans nGQL
+  does not hold the main graph dataset
+
+metad:
+  metadata/control plane
+  spaces, schema, topology, partition metadata
+  persistent
+
+storaged:
+  actual graph partitions
+  vertices and edges
+  persistent
+```
+
+In the Final Run, metad and storaged received PVCs; graphd did not receive a main graph-data PVC.
+
+---
+
+## 9. What problem does a Kubernetes operator solve compared with plain StatefulSet manifests, and what new failure modes does it introduce?
+
+A StatefulSet knows generic Kubernetes stateful-workload semantics, but it does not understand Elasticsearch or NebulaGraph as database systems.
+
+An operator adds:
+
+```text
+CRDs
++
+application-aware reconciliation loop
+```
+
+so the desired state can be expressed at the database/application level and automatically translated into lower-level Kubernetes resources and lifecycle actions.
+
+Benefits include:
+
+- application-specific lifecycle automation;
+- consistent reconciliation;
+- easier topology/scaling changes;
+- higher-level declarative configuration.
+
+New failure modes include:
+
+- operator/controller bugs;
+- CRD/operator version incompatibility;
+- unexpected reconciliation;
+- controller outages;
+- an additional privileged dependency in the cluster.
+
+The operator itself must therefore be versioned, monitored, and tested like any other production control-plane component.
+
+---
+
+# Final Task 6 Repository Artifacts
+
+## PostgreSQL / data
+
+```text
+data/namespace.yaml
+data/postgres-authorization-policy.yaml
+data/postgres-backup-cronjob.yaml
+data/postgres-backup-pvc.yaml
+data/postgres-headless-service.yaml
+data/postgres-peer-authentication.yaml
+data/postgres-statefulset.yaml
+
+runbooks/postgres-restore.md
+```
+
+## Redis
+
+```text
+redis/cache-aside-notes.md
+redis/redis-authorization-policy.yaml
+redis/redis-networkpolicy.yaml
+redis/redis-peer-authentication.yaml
+redis/redis-service.yaml
+redis/redis-statefulset.yaml
+redis/sentinel-lab.yaml
+redis/sentinel-vs-cluster.md
+```
+
+## Elasticsearch / Kibana
+
+```text
+elastic/elasticsearch.yaml
+elastic/ilm-notes.md
+elastic/kibana.yaml
+elastic/products-bulk.ndjson
+elastic/products-mapping.json
+elastic/query-aggregation.json
+elastic/query-bool.json
+elastic/query-fuzzy.json
+elastic/resource-discipline.md
+
+runbooks/elasticsearch-snapshot.md
+istio/kibana-virtualservice.yaml
+docs/evidence/task6/kibana-dev-tools-products-query.png
+```
+
+## NebulaGraph
+
+```text
+nebula/nebula-cluster.yaml
+nebula/queries.ngql
+nebula/sample-data.ngql
+nebula/schema.ngql
+nebula/studio.yaml
+
+runbooks/nebula-backup.md
+istio/nebula-studio-virtualservice.yaml
+docs/evidence/task6/nebula-studio-shopstack-graph.png
+```
+
+The existing:
+
+```text
+istio/gateway.yaml
+```
+
+was modified to add:
+
+```text
+kibana.shopstack.local
+studio.shopstack.local
+```
+
+while preserving `shopstack.local`.
+
+At the final audit:
+
+```text
+elastic/kibana.yaml      count: 1
+nebula/studio.yaml       replicas: 1
+nebula/nebula-cluster    graphd=1, metad=1, storaged=2
+```
+
+were all present in the tracked desired-state files.
+
+---
+
+# Task 6 Summary
+
+Task 6 Final Run completed all four data-store areas:
+
+```text
+PostgreSQL
+  hand-written StatefulSet
+  stable PVC
+  logical backup / real restore drill
+  nightly CronJob
+  reporting read-only role
+  Istio namespace restriction
+  EXPLAIN ANALYZE / pg_stat_activity
+
+Redis
+  Redis 8.10.1 StatefulSet
+  Secret-based authentication
+  STRING / HASH / LIST / SET / ZSET
+  TTL expiry proof
+  AOF + BGSAVE + PVC restart persistence proof
+  cache-aside demonstration
+  INFO metrics and 83.3% observed hit rate
+  Redis namespace isolation
+  real 3-node Sentinel failover drill
+
+Elasticsearch / Kibana
+  ECK 3.5.0 operator
+  Elasticsearch 9.5.3 single-node cluster
+  2Gi JVM heap and 5Gi PVC
+  ECK-generated credentials
+  corrected title mapping
+  10-product bulk index
+  fuzzy / bool+range / aggregation queries
+  Kibana through Istio
+  required Dev Tools screenshot
+  yellow-shard diagnosis
+  snapshot runbook
+  ILM notes
+  real kubectl top resource evidence
+
+NebulaGraph
+  Nebula Operator chart 1.8.8
+  NebulaGraph 3.8.0
+  graphd / metad / storaged
+  PVC-backed persistent components
+  product/customer graph
+  browsed/bought relationships
+  three required nGQL queries
+  storaged scale 1 -> 2
+  delete/recreate persistence proof with stable PVC/PV
+  BR backup runbook
+  NebulaGraph Studio through Istio
+  Studio screenshot evidence
+```
+
+The task also produced real troubleshooting evidence around private API tunnels, SQL quoting, Redis persistence, ECK resource type assumptions, Elasticsearch mapping correction, Metrics Server kubelet certificates, nGQL command parsing, graph-query semantics, Istio Gateway validation, and fixed-size cluster capacity.
+
+---
+
+**Task 6 status: COMPLETE**
+---

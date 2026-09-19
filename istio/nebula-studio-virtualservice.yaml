@@ -1,0 +1,16 @@
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: nebula-studio
+  namespace: shopstack
+spec:
+  hosts:
+    - studio.shopstack.local
+  gateways:
+    - shopstack-gateway
+  http:
+    - route:
+        - destination:
+            host: nebula-studio.data.svc.cluster.local
+            port:
+              number: 7001

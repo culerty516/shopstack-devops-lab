@@ -1,0 +1,9 @@
+USE shopstack;
+
+INSERT VERTEX product(name, category, price) VALUES "p001":("Mouse", "electronics", 199.0), "p002":("Keyboard", "electronics", 699.0), "p003":("USB Hub", "electronics", 329.0), "p004":("Laptop Stand", "accessories", 249.0), "p005":("Bottle", "lifestyle", 129.0);
+
+INSERT VERTEX customer(name) VALUES "c001":("Gerald"), "c002":("Pei"), "c003":("Mia");
+
+INSERT EDGE bought(quantity) VALUES "c001"->"p001":(1), "c001"->"p002":(1), "c001"->"p003":(1), "c002"->"p001":(1), "c002"->"p004":(1), "c003"->"p001":(1), "c003"->"p005":(1);
+
+INSERT EDGE browsed() VALUES "c001"->"p004":(), "c002"->"p002":(), "c003"->"p003":();

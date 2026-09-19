@@ -1,0 +1,17 @@
+{
+  "size": 0,
+  "aggs": {
+    "products_by_category": {
+      "terms": {
+        "field": "category"
+      },
+      "aggs": {
+        "average_price": {
+          "avg": {
+            "field": "price"
+          }
+        }
+      }
+    }
+  }
+}

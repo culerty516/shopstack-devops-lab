@@ -13,3 +13,5 @@ spec:
         protocol: HTTP
       hosts:
         - shopstack.local
+        - kibana.shopstack.local
+        - studio.shopstack.local

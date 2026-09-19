@@ -1,0 +1,20 @@
+{"index":{"_id":"SKU-001"}}
+{"sku":"SKU-001","title":"Mouse","description":"Wireless ergonomic computer mouse","category":"electronics","price":199.00,"stock":42}
+{"index":{"_id":"SKU-002"}}
+{"sku":"SKU-002","title":"Keyboard","description":"Mechanical keyboard with backlit keys","category":"electronics","price":699.00,"stock":25}
+{"index":{"_id":"SKU-003"}}
+{"sku":"SKU-003","title":"USB Hub","description":"Seven port USB-C expansion hub","category":"electronics","price":329.00,"stock":31}
+{"index":{"_id":"SKU-004"}}
+{"sku":"SKU-004","title":"Laptop Stand","description":"Adjustable aluminium laptop stand","category":"accessories","price":249.00,"stock":18}
+{"index":{"_id":"SKU-005"}}
+{"sku":"SKU-005","title":"Bottle","description":"Insulated stainless steel water bottle","category":"lifestyle","price":129.00,"stock":55}
+{"index":{"_id":"SKU-006"}}
+{"sku":"SKU-006","title":"Webcam","description":"Full HD USB webcam for video meetings","category":"electronics","price":459.00,"stock":20}
+{"index":{"_id":"SKU-007"}}
+{"sku":"SKU-007","title":"Desk Mat","description":"Large non-slip desk mat for keyboard and mouse","category":"accessories","price":159.00,"stock":38}
+{"index":{"_id":"SKU-008"}}
+{"sku":"SKU-008","title":"Headphones","description":"Wireless noise cancelling headphones","category":"electronics","price":899.00,"stock":14}
+{"index":{"_id":"SKU-009"}}
+{"sku":"SKU-009","title":"Travel Mug","description":"Reusable thermal travel mug","category":"lifestyle","price":179.00,"stock":27}
+{"index":{"_id":"SKU-010"}}
+{"sku":"SKU-010","title":"Monitor Light","description":"USB powered monitor light bar","category":"accessories","price":299.00,"stock":22}

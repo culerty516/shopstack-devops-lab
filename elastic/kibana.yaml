@@ -1,0 +1,31 @@
+apiVersion: kibana.k8s.elastic.co/v1
+kind: Kibana
+metadata:
+  name: shopstack
+  namespace: data
+spec:
+  version: 9.5.3
+  count: 1
+
+  elasticsearchRef:
+    name: shopstack
+
+  http:
+    tls:
+      selfSignedCertificate:
+        disabled: true
+
+  podTemplate:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-worker-1
+
+      containers:
+        - name: kibana
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

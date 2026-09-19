@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nebula-studio
+  namespace: data
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nebula-studio
+  template:
+    metadata:
+      labels:
+        app: nebula-studio
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-worker-1
+      containers:
+        - name: studio
+          image: vesoft/nebula-graph-studio:v3.10.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 7001
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nebula-studio
+  namespace: data
+spec:
+  selector:
+    app: nebula-studio
+  ports:
+    - name: http
+      port: 7001
+      targetPort: 7001
+  type: ClusterIP

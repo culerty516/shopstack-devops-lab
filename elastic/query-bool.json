@@ -1,0 +1,23 @@
+{
+  "query": {
+    "bool": {
+      "must": [
+        {
+          "match": {
+            "title": "keyboard"
+          }
+        }
+      ],
+      "filter": [
+        {
+          "range": {
+            "price": {
+              "gte": 200,
+              "lte": 800
+            }
+          }
+        }
+      ]
+    }
+  }
+}

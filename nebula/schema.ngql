@@ -1,0 +1,23 @@
+CREATE SPACE IF NOT EXISTS shopstack (
+  partition_num = 1,
+  replica_factor = 1,
+  vid_type = FIXED_STRING(32)
+);
+
+USE shopstack;
+
+CREATE TAG IF NOT EXISTS product(
+  name string,
+  category string,
+  price double
+);
+
+CREATE TAG IF NOT EXISTS customer(
+  name string
+);
+
+CREATE EDGE IF NOT EXISTS browsed();
+
+CREATE EDGE IF NOT EXISTS bought(
+  quantity int
+);

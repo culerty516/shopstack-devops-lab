@@ -1,0 +1,19 @@
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: redis-shopstack-only
+  namespace: data
+spec:
+  selector:
+    matchLabels:
+      app: redis
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces:
+              - shopstack
+      to:
+        - operation:
+            ports:
+              - "6379"

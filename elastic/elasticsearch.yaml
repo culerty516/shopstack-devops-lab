@@ -1,0 +1,44 @@
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: shopstack
+  namespace: data
+spec:
+  version: 9.5.3
+
+  nodeSets:
+    - name: default
+      count: 1
+
+      config:
+        node.store.allow_mmap: false
+
+      podTemplate:
+        spec:
+          nodeSelector:
+            kubernetes.io/hostname: k8s-worker-2
+
+          containers:
+            - name: elasticsearch
+              env:
+                - name: ES_JAVA_OPTS
+                  value: "-Xms2g -Xmx2g"
+
+              resources:
+                requests:
+                  cpu: 500m
+                  memory: 2300Mi
+                limits:
+                  cpu: "2"
+                  memory: 3Gi
+
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            storageClassName: local-path
+            resources:
+              requests:
+                storage: 5Gi

@@ -1,0 +1,7 @@
+USE shopstack;
+
+MATCH (c:customer)-[:bought]->(p:product) WHERE id(c) == "c001" RETURN c.customer.name AS customer, id(p) AS product_id, p.product.name AS product, p.product.price AS price;
+
+MATCH (p1:product)<-[:bought]-(c:customer)-[:bought]->(p2:product) WHERE id(p1) == "p001" AND id(p2) != "p001" RETURN DISTINCT id(p2) AS product_id, p2.product.name AS recommended_product;
+
+MATCH (:customer)-[:bought]->(p:product) RETURN id(p) AS product_id, p.product.name AS product, count(*) AS purchase_count ORDER BY purchase_count DESC;

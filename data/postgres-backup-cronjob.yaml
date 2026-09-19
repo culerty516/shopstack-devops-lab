@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: shopstack
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: postgres-backup
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: pg-dump
+              image: postgres:16
+              env:
+                - name: PGHOST
+                  value: postgres-headless.data.svc.cluster.local
+                - name: PGPORT
+                  value: "5432"
+                - name: PGUSER
+                  valueFrom:
+                    secretKeyRef:
+                      name: frontend-db-secret
+                      key: db-user
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: frontend-db-secret
+                      key: db-password
+              command:
+                - sh
+                - -c
+                - |
+                  set -eu
+                  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+                  output="/backups/boutique-${timestamp}.dump"
+
+                  echo "Creating backup: ${output}"
+
+                  pg_dump \
+                    -d boutique \
+                    -Fc \
+                    -f "${output}"
+
+                  echo "Backup completed:"
+                  ls -lh "${output}"
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: postgres-backups
