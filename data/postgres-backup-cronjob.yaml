@@ -21,6 +21,10 @@ spec:
             - name: pg-dump
               image: postgres:16
               env:
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
                 - name: PGHOST
                   value: postgres-headless.data.svc.cluster.local
                 - name: PGPORT
@@ -40,11 +44,14 @@ spec:
                 - -c
                 - |
                   set -eu
+
                   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
                   output="/backups/boutique-${timestamp}.dump"
+                  marker="/backups/.${POD_NAME}.ready"
+
+                  rm -f "${marker}"
 
                   echo "Creating backup: ${output}"
-
                   pg_dump \
                     -d boutique \
                     -Fc \
@@ -52,9 +59,74 @@ spec:
 
                   echo "Backup completed:"
                   ls -lh "${output}"
+
+                  printf '%s\n' "${output}" > "${marker}"
               volumeMounts:
                 - name: backups
                   mountPath: /backups
+
+            - name: minio-upload
+              image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+              env:
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: MINIO_ENDPOINT
+                  value: http://minio.storage.svc.cluster.local:9000
+                - name: MINIO_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: minio-backup-credentials
+                      key: MINIO_ACCESS_KEY
+                - name: MINIO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: minio-backup-credentials
+                      key: MINIO_SECRET_KEY
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+
+                  marker="/backups/.${POD_NAME}.ready"
+                  attempts=0
+
+                  while [ ! -s "${marker}" ]; do
+                    attempts=$((attempts + 1))
+                    if [ "${attempts}" -ge 90 ]; then
+                      echo "Timed out waiting for pg_dump completion marker"
+                      exit 1
+                    fi
+                    sleep 2
+                  done
+
+                  output="$(cat "${marker}")"
+
+                  if [ ! -s "${output}" ]; then
+                    echo "Backup file is missing or empty: ${output}"
+                    exit 1
+                  fi
+
+                  mc alias set \
+                    backup \
+                    "${MINIO_ENDPOINT}" \
+                    "${MINIO_ACCESS_KEY}" \
+                    "${MINIO_SECRET_KEY}" \
+                    >/dev/null
+
+                  object="backup/shopstack-backups/$(basename "${output}")"
+
+                  echo "Uploading $(basename "${output}") to shopstack-backups"
+                  mc cp "${output}" "${object}"
+
+                  echo "Object backup completed: ${object}"
+                  rm -f "${marker}"
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+
           volumes:
             - name: backups
               persistentVolumeClaim:

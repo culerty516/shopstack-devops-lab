@@ -4340,7 +4340,7 @@ The pushed image was initially a **single-platform OCI image**, not a multi-arch
 podman manifest inspect ...
 ```
 
-returned an error explaining that treating a single image as a manifest list was not implemented. This was not a failed push; the multi-architecture index was intentionally created later in Task 7.6.
+returned an error explaining that treating a single image as a manifest list was not implemented. This was not a failed push; the multi-architecture index was intentionally created later in Section 7.6 of Task 4.
 
 An anonymous remote inspection initially received `401 Unauthorized` because the GHCR package was private. I changed the package visibility to public. After that, I logged Docker out of GHCR and successfully pulled the package anonymously, proving the cluster could also pull it without an imagePullSecret.
 
@@ -5454,7 +5454,7 @@ The final implementation demonstrated:
 - migration from loose frontend resources to the Helm-owned `shopstack-frontend` release;
 - Helm chart packaging plus OCI push/pull through GHCR as an additional stretch exercise.
 
-Both Task 7.6.6 (automated CI deploy stage) and Task 7.7.6 (Helm OCI packaging/distribution) stretch goals were completed.
+Both Task 4 Section 7.6.6 (automated CI deploy stage) and Section 7.7.6 (Helm OCI packaging/distribution) stretch goals were completed.
 
 ---
 
@@ -5748,7 +5748,7 @@ The manually pushed `0.1.0` package at that point was one AMD64 OCI image, not a
 
 **Resolution**
 
-Used normal image inspection/pull to verify it. The proper AMD64+ARM64 OCI index was subsequently built in Task 7.6 using Buildx.
+Used normal image inspection/pull to verify it. The proper AMD64+ARM64 OCI index was subsequently built in Section 7.6 of Task 4 using Buildx.
 
 ---
 
@@ -7279,7 +7279,7 @@ NAME         PROVISIONER             RECLAIM   BINDING
 local-path   rancher.io/local-path   Delete    WaitForFirstConsumer
 ```
 
-This StorageClass was used only as the Task 6 lab persistence substrate. It is **not** being treated as the Task 7 production-style block-storage / CSI implementation.
+This StorageClass was used as the lab persistence substrate. Task 7 separately demonstrates cloud block storage with GCP Persistent Disk, documents the GCE PD CSI production direction, and uses `local-path` for the Kubernetes persistence exercises as permitted by the task.
 
 ---
 
@@ -7293,7 +7293,7 @@ I created the `data` namespace declaratively:
 data/namespace.yaml
 ```
 
-Before creating PostgreSQL, I verified the existing Task 7.3/Task 4 frontend database Secret:
+Before creating PostgreSQL, I verified the existing Task 4 Section 7.3 frontend database Secret:
 
 ```text
 namespace: shopstack
@@ -7315,8 +7315,8 @@ data/frontend-db-secret
 I compared the source and destination encoded values and received:
 
 ```text
-PASS: data/db-user exactly matches Task 7.3 shopstack/db-user
-PASS: data/db-password exactly matches Task 7.3 shopstack/db-password
+PASS: data/db-user exactly matches Task 4 Section 7.3 shopstack/db-user
+PASS: data/db-password exactly matches Task 4 Section 7.3 shopstack/db-password
 ```
 
 The credential values were not committed as a new plaintext Secret manifest.
@@ -10517,4 +10517,2199 @@ The task also produced real troubleshooting evidence around private API tunnels,
 ---
 
 **Task 6 status: COMPLETE**
+---
+
+# Task 7 — Storage: Block and Object
+
+**Date completed:** 2026-09-20<br>
+**Working machine:** MacBook Pro (Apple Silicon, arm64)<br>
+**Primary Kubernetes environment:** Three-node kubeadm cluster on Google Compute Engine<br>
+**Kubernetes version:** v1.37.0<br>
+**Container runtime:** containerd 2.2.1<br>
+**StorageClass used for Kubernetes persistence exercises:** `local-path` (`rancher.io/local-path`)<br>
+**MinIO server:** `RELEASE.2025-04-22T22-12-26Z`<br>
+**MinIO client (`mc`):** `RELEASE.2025-08-13T08-35-41Z`<br>
+**Istio version already present from Task 5:** 1.31.0
+
+The Task 3–6 kubeadm cluster was reused directly.
+
+Because the Final Run uses Google Compute Engine rather than Proxmox, the Task 10.1 hypervisor-side block-storage exercise was implemented with **GCP Persistent Disk hot-attach**. This is the same block-storage concept from the guest Linux point of view, but I documented the provider substitution explicitly rather than claiming that Proxmox was used.
+
+The Kubernetes API remained private. Local `kubectl` access continued to use:
+
+```bash
+export KUBECONFIG="$HOME/.kube/task4-final-config"
+```
+
+and, when required, the existing SSH tunnel:
+
+```bash
+ssh -fN \
+  -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:6443:10.10.0.10:6443 \
+  k8s-cp
+```
+
+---
+
+# Pre-task Cluster Recovery and Resource Discipline
+
+Before starting the storage exercises, `k8s-worker-2` had stopped posting normal node status.
+
+Serial-console evidence repeatedly showed:
+
+```text
+systemd[1]: Failed to start systemd-journald.service - Journal Service.
+```
+
+I searched the serial output for OOM and disk-capacity evidence:
+
+```bash
+gcloud compute instances get-serial-port-output k8s-worker-2 \
+  --zone=us-central1-a \
+  --port=1 \
+  | grep -Ei 'oom-killer|out of memory|killed process|memory cgroup'
+```
+
+No OOM-killer evidence was returned.
+
+I also searched for storage errors:
+
+```bash
+gcloud compute instances get-serial-port-output k8s-worker-2 \
+  --zone=us-central1-a \
+  --port=1 \
+  | grep -Ei 'no space left|filesystem|ext4-fs|I/O error|read-only file system|disk'
+```
+
+The output contained normal historical boot-time ext4 messages, including the root filesystem initially mounting read-only and then being remounted read-write. It did not provide evidence of a current full-disk or I/O failure.
+
+Because the guest remained unhealthy while the GCP VM itself was running, I performed a GCE instance reset:
+
+```bash
+gcloud compute instances reset k8s-worker-2 \
+  --zone=us-central1-a \
+  --quiet
+```
+
+My first `kubectl wait` after the reset accidentally used the default localhost context because `KUBECONFIG` had not yet been exported in that Terminal:
+
+```text
+The connection to the server localhost:8080 was refused
+```
+
+I corrected the client environment:
+
+```bash
+export KUBECONFIG="$HOME/.kube/task4-final-config"
+kubectl config current-context
+```
+
+Result:
+
+```text
+kubernetes-admin@kubernetes
+```
+
+The worker then returned Ready:
+
+```text
+k8s-cp         Ready
+k8s-worker-1   Ready
+k8s-worker-2   Ready
+```
+
+I verified SSH access and PostgreSQL integrity:
+
+```bash
+ssh k8s-worker-2 'hostname; uptime'
+```
+
+```bash
+kubectl -n data exec postgres-0 -c postgres -- sh -ec '
+psql -U "$POSTGRES_USER" -d boutique \
+  -Atc "SELECT COUNT(*) FROM products;"
+'
+```
+
+Result:
+
+```text
+5
+```
+
+This confirmed that the recovery did not damage the PostgreSQL dataset.
+
+## Temporary Elasticsearch scale-down
+
+`kubectl top` showed Elasticsearch using approximately:
+
+```text
+2263Mi
+```
+
+and `k8s-worker-2` was at approximately 74% memory after recovery.
+
+The Elasticsearch CR was actually named:
+
+```text
+data/shopstack
+```
+
+not `shopstack-es`.
+
+I confirmed the runtime relationship:
+
+```text
+Elasticsearch CR: shopstack
+StatefulSet:      shopstack-es-default
+```
+
+For Task 7 resource headroom, I temporarily paused the ECK operator and scaled the generated Elasticsearch StatefulSet to zero:
+
+```bash
+kubectl -n elastic-system scale statefulset elastic-operator \
+  --replicas=0
+```
+
+```bash
+kubectl -n data scale statefulset shopstack-es-default \
+  --replicas=0
+```
+
+The Elasticsearch PVC remained Bound:
+
+```text
+elasticsearch-data-shopstack-es-default-0
+5Gi
+RWO
+local-path
+```
+
+After the Elasticsearch Pod terminated, `k8s-worker-2` memory dropped to approximately:
+
+```text
+735Mi / 19%
+```
+
+This was a **temporary lab runtime capacity measure**. The tracked Elasticsearch CR still declares one node. Before a later full-stack demo or Capstone run, ECK/Elasticsearch must be restored to the tracked desired state.
+
+---
+
+# 10.1 Block Storage on Linux
+
+## 10.1.1 Hot-add a block disk
+
+I used `k8s-worker-1` for the Task 7 Linux block-storage exercise so the PostgreSQL node on `k8s-worker-2` was not disturbed.
+
+Before attaching a disk:
+
+```bash
+ssh k8s-worker-1 \
+  'lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS'
+```
+
+The VM had only its existing 40 GiB boot disk:
+
+```text
+sda  40G
+```
+
+I also confirmed the initial disk set with:
+
+```bash
+ssh k8s-worker-1 \
+  'sudo fdisk -l 2>/dev/null | grep "^Disk /dev/"'
+```
+
+I created a dedicated 10 GiB GCP `pd-balanced` disk:
+
+```bash
+gcloud compute disks create task7-block-worker1 \
+  --size=10GB \
+  --type=pd-balanced \
+  --zone=us-central1-a
+```
+
+and hot-attached it to the running VM:
+
+```bash
+gcloud compute instances attach-disk k8s-worker-1 \
+  --disk=task7-block-worker1 \
+  --device-name=task7-block \
+  --mode=rw \
+  --zone=us-central1-a
+```
+
+After `udevadm settle`, `lsblk` showed:
+
+```text
+sdb  10G  disk
+```
+
+The stable GCP device symlink resolved to:
+
+```bash
+readlink -f /dev/disk/by-id/google-task7-block
+```
+
+Result:
+
+```text
+/dev/sdb
+```
+
+`fdisk -l` confirmed:
+
+```text
+Disk /dev/sdb: 10 GiB
+Disk model: PersistentDisk
+```
+
+The disk was initially unpartitioned and unformatted.
+
+---
+
+## 10.1.2 Partition, XFS, `/data`, and UUID-based `fstab`
+
+I created a GPT partition table and one Linux filesystem partition:
+
+```bash
+ssh k8s-worker-1 '
+DEV="$(readlink -f /dev/disk/by-id/google-task7-block)"
+printf "g\nn\n1\n\n\nw\n" | sudo fdisk "$DEV"
+'
+```
+
+The resulting layout was:
+
+```text
+sdb      10G disk
+└─sdb1   10G part
+```
+
+I formatted the partition as XFS:
+
+```bash
+ssh k8s-worker-1 '
+PART=/dev/disk/by-id/google-task7-block-part1
+sudo mkfs.xfs "$PART"
+'
+```
+
+I mounted it at `/data`:
+
+```bash
+ssh k8s-worker-1 '
+sudo mkdir -p /data
+PART=/dev/disk/by-id/google-task7-block-part1
+sudo mount "$PART" /data
+'
+```
+
+Verification:
+
+```text
+TARGET SOURCE    FSTYPE
+/data  /dev/sdb1 xfs
+```
+
+and:
+
+```text
+/dev/sdb1  xfs  10G  ...  /data
+```
+
+The XFS filesystem UUID was:
+
+```text
+3156f12a-78de-4791-b088-e77280d130e6
+```
+
+I backed up `/etc/fstab` and added a UUID-based entry:
+
+```text
+UUID=3156f12a-78de-4791-b088-e77280d130e6 /data xfs defaults 0 0
+```
+
+I tested the entry by unmounting and mounting from `fstab`:
+
+```bash
+sudo umount /data
+sudo mount -a
+```
+
+`findmnt /data` again showed:
+
+```text
+/data  /dev/sdb1  xfs
+```
+
+### Why `/dev/sdb` is unsafe in `/etc/fstab`
+
+Names such as `/dev/sdb` are kernel enumeration names. They can change when disks are added/removed or when device discovery order changes during boot.
+
+A filesystem UUID identifies the filesystem itself and is therefore a more stable persistent-mount reference.
+
+For a cloud VM, the provider's `/dev/disk/by-id/...` names are also useful for identifying attached disks, while the filesystem UUID is appropriate for the final persistent filesystem mount.
+
+---
+
+## 10.1.3 LVM Stretch — online growth
+
+I completed the optional LVM stretch goal using a second dedicated 10 GiB Persistent Disk:
+
+```bash
+gcloud compute disks create task7-lvm-worker1 \
+  --size=10GB \
+  --type=pd-balanced \
+  --zone=us-central1-a
+```
+
+```bash
+gcloud compute instances attach-disk k8s-worker-1 \
+  --disk=task7-lvm-worker1 \
+  --device-name=task7-lvm \
+  --mode=rw \
+  --zone=us-central1-a
+```
+
+The guest identified it as:
+
+```text
+/dev/sdc
+```
+
+I created the LVM stack:
+
+```bash
+sudo pvcreate /dev/sdc
+sudo vgcreate shopstack-vg /dev/sdc
+sudo lvcreate -L 4G -n data-lv shopstack-vg
+```
+
+Initial state:
+
+```text
+PV: /dev/sdc
+VG: shopstack-vg
+LV: data-lv
+LV size: 4.00 GiB
+VG free: <6.00 GiB
+```
+
+I formatted the logical volume as XFS and mounted it:
+
+```bash
+sudo mkfs.xfs /dev/shopstack-vg/data-lv
+sudo mkdir -p /data-lvm
+sudo mount /dev/shopstack-vg/data-lv /data-lvm
+```
+
+I wrote a marker before resizing:
+
+```text
+Task 7 LVM online growth test
+```
+
+Before growth:
+
+```text
+LV size:        4.00 GiB
+XFS filesystem: 4.0 GiB
+```
+
+I extended the logical volume while it remained mounted:
+
+```bash
+sudo lvextend -l +100%FREE /dev/shopstack-vg/data-lv
+```
+
+Immediately afterward:
+
+```text
+LV size:        <10.00 GiB
+XFS filesystem: 4.0 GiB
+```
+
+This demonstrated that growing the block device/LV does not automatically grow the filesystem.
+
+I then resized XFS online:
+
+```bash
+sudo xfs_growfs /data-lvm
+```
+
+Final state:
+
+```text
+LV size:        <10.00 GiB
+XFS filesystem: 10 GiB
+```
+
+The pre-growth marker still existed, proving that the online resize preserved existing data.
+
+### Why LVM matters in cloud environments
+
+Cloud disks are frequently resized as capacity requirements grow. LVM adds an abstraction layer between block devices and filesystems, allowing capacity to be pooled and logical volumes to be extended without redesigning the application mount layout.
+
+The storage layers are:
+
+```text
+cloud block disk
+  -> LVM PV
+  -> VG
+  -> LV
+  -> filesystem
+  -> mount point
+```
+
+The cloud provider can enlarge or add block devices; LVM then provides flexible guest-side allocation before the filesystem is grown.
+
+---
+
+# 10.2 Persistent Storage in Kubernetes
+
+## 10.2.1 StorageClass, dynamic provisioning, and CSI
+
+The cluster used the Rancher Local Path Provisioner installed during Task 6.
+
+```bash
+kubectl get storageclass
+```
+
+Result:
+
+```text
+NAME         PROVISIONER             RECLAIM   BINDING
+local-path   rancher.io/local-path   Delete    WaitForFirstConsumer
+```
+
+It was not marked as the default StorageClass.
+
+The PostgreSQL claim explicitly requested:
+
+```text
+storageClassName: local-path
+```
+
+### Dynamic provisioning
+
+Dynamic provisioning means that an application requests storage through a PVC and the StorageClass/provisioner creates a matching PV automatically, instead of an administrator pre-creating each PV manually.
+
+In this lab:
+
+```text
+PVC
+  -> StorageClass local-path
+  -> rancher.io/local-path provisioner
+  -> dynamically created PV
+```
+
+The local-path provisioner is a lab persistence substrate. It creates node-local storage and is **not** being treated as production cloud block CSI storage.
+
+### CSI research
+
+CSI stands for **Container Storage Interface**. It standardizes how storage vendors integrate provisioning, attachment, mounting, expansion, and lifecycle operations with Kubernetes.
+
+For this GCP environment, the cloud block-storage driver I would use for a production-style Persistent Disk implementation is the **GCE Persistent Disk CSI Driver**, whose CSI driver name is:
+
+```text
+pd.csi.storage.gke.io
+```
+
+Task 10.2 explicitly permits using a simple local provisioner for these exercises, so I did not turn Task 7 into a GCP CSI reconfiguration exercise.
+
+---
+
+## 10.2.2 PostgreSQL PVC and real database files
+
+The Task 6 PostgreSQL StatefulSet already used the required 5 GiB RWO `volumeClaimTemplates` configuration:
+
+```text
+name=postgres-data
+storageClass=local-path
+accessModes=ReadWriteOnce
+size=5Gi
+```
+
+The volume was mounted at:
+
+```text
+/var/lib/postgresql/data
+```
+
+The PostgreSQL container used:
+
+```text
+PGDATA=/var/lib/postgresql/data/pgdata
+```
+
+The PVC was:
+
+```text
+postgres-data-postgres-0
+```
+
+and was Bound to:
+
+```text
+pvc-8ce1363e-8b71-49b9-bd9f-0747bbc8e2f5
+```
+
+The database files were present under the PVC-backed path, including:
+
+```text
+base/
+global/
+pg_commit_ts/
+pg_logical/
+pg_multixact/
+pg_stat/
+...
+```
+
+This demonstrated that the StatefulSet was not merely declaring a PVC; PostgreSQL's actual database cluster lived on the mounted persistent storage.
+
+---
+
+## 10.2.3 Persistence proof — delete Pod
+
+Before deleting `postgres-0`:
+
+```text
+OLD_UID=6a4e3161-8bac-480f-a5cf-d67bd5dcbebd
+PV=pvc-8ce1363e-8b71-49b9-bd9f-0747bbc8e2f5
+products row count=5
+```
+
+I deleted the Pod:
+
+```bash
+kubectl -n data delete pod postgres-0
+```
+
+The StatefulSet recreated it and it became Ready.
+
+The new UID was:
+
+```text
+NEW_UID=7cc8a59e-7514-4423-a831-1b2766dc82cc
+```
+
+The Pod object was therefore definitely new, but the PVC remained:
+
+```text
+postgres-data-postgres-0
+```
+
+and the PV remained:
+
+```text
+pvc-8ce1363e-8b71-49b9-bd9f-0747bbc8e2f5
+```
+
+The database row count was still:
+
+```text
+5
+```
+
+This demonstrated that Pod lifecycle and persistent-data lifecycle were separated.
+
+---
+
+## 10.2.3 Persistence proof — delete whole StatefulSet
+
+Before deleting the StatefulSet I checked its PVC retention policy:
+
+```text
+whenDeleted=Retain
+whenScaled=Retain
+```
+
+The PVC did not have an owner reference that would cause it to be automatically garbage-collected with the StatefulSet.
+
+The bound PV had:
+
+```text
+reclaimPolicy=Delete
+```
+
+These are different lifecycle controls:
+
+```text
+StatefulSet PVC retention policy
+  -> controls whether the PVC survives StatefulSet deletion/scaling
+
+PV reclaim policy
+  -> controls what happens to the PV/backend storage when the PVC itself is released/deleted
+```
+
+I recorded the existing PV:
+
+```text
+BEFORE_PV=pvc-8ce1363e-8b71-49b9-bd9f-0747bbc8e2f5
+```
+
+I deleted the StatefulSet:
+
+```bash
+kubectl -n data delete statefulset postgres
+```
+
+After the Pod disappeared, the PVC was still:
+
+```text
+Bound
+```
+
+and the PV was still:
+
+```text
+Bound
+```
+
+I recreated the StatefulSet from the tracked manifest:
+
+```bash
+kubectl apply -f data/postgres-statefulset.yaml
+```
+
+After `postgres-0` returned Ready:
+
+```text
+AFTER_PV=pvc-8ce1363e-8b71-49b9-bd9f-0747bbc8e2f5
+```
+
+The exact same PV was reused.
+
+The product row count was again:
+
+```text
+5
+```
+
+This proved persistence across deletion and recreation of the whole StatefulSet.
+
+### Retain vs Delete
+
+A PV with `Retain` is not automatically destroyed when its claim is released; an administrator must deliberately recover or clean it up.
+
+A PV with `Delete` allows the provisioner to remove the backing storage when the PVC is deleted/released.
+
+In this exercise, the StatefulSet-level PVC retention policy was `Retain`, so deleting the StatefulSet did not delete the PVC. The PV therefore never reached the stage where its `Delete` reclaim policy would remove the backing storage.
+
+---
+
+## 10.2.4 RWO second-node test
+
+The PostgreSQL PV node affinity was:
+
+```text
+kubernetes.io/hostname = k8s-worker-2
+```
+
+I created the declarative test Pod:
+
+```text
+storage/rwo-second-node-test.yaml
+```
+
+It referenced:
+
+```text
+postgres-data-postgres-0
+```
+
+but deliberately selected:
+
+```text
+kubernetes.io/hostname: k8s-worker-1
+```
+
+The Pod remained:
+
+```text
+Pending
+```
+
+The scheduler reported:
+
+```text
+0/3 nodes are available:
+1 node(s) didn't match PersistentVolume's node affinity,
+1 node(s) didn't match Pod's node affinity/selector,
+1 node(s) had untolerated taint(s).
+```
+
+After capturing the evidence I deleted only the test Pod. PostgreSQL remained:
+
+```text
+2/2 Running
+```
+
+and the row count remained:
+
+```text
+5
+```
+
+### RWO vs RWX
+
+`ReadWriteOnce` means a volume is mounted read-write by a single **node** at a time. It does not necessarily mean that only one Pod on that same node can ever reference it.
+
+`ReadWriteMany` is intended for storage that multiple nodes can mount read-write concurrently, typically a shared file-storage system such as NFS.
+
+In this lab, the local-path PV was also tied to `k8s-worker-2` through node affinity. Therefore the observed failure was specifically a **local PV topology/node-affinity conflict**, not a cloud CSI `Multi-Attach` error.
+
+For this lab's database usage, the practical conclusion is:
+
+> **block storage = one filesystem, one consumer at a time; this is exactly what a database wants.**
+
+The more precise Kubernetes nuance is that RWO is a single-node access mode.
+
+---
+
+# 10.3 Object Storage — MinIO
+
+## 10.3.1 Deploy PVC-backed MinIO
+
+I created the namespace declaratively:
+
+```text
+minio/namespace.yaml
+```
+
+Namespace:
+
+```text
+storage
+```
+
+Root credentials were generated at runtime and stored in:
+
+```text
+Secret/storage/minio-root-credentials
+```
+
+The actual credential values were not written into the journal or committed to Git.
+
+I created:
+
+```text
+minio/pvc.yaml
+minio/deployment.yaml
+minio/service.yaml
+```
+
+The PVC requested:
+
+```text
+5Gi
+ReadWriteOnce
+storageClassName: local-path
+```
+
+The Deployment used:
+
+```text
+quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+```
+
+with:
+
+```text
+API:     9000
+Console: 9001
+```
+
+The MinIO Pod became:
+
+```text
+1/1 Running
+```
+
+and the PVC became:
+
+```text
+minio-data
+Bound
+5Gi
+RWO
+local-path
+```
+
+The dynamically created PV was:
+
+```text
+pvc-f89f6458-8584-4e77-b34f-f8434f03e287
+```
+
+with node affinity to:
+
+```text
+k8s-worker-2
+```
+
+Inside the container:
+
+```bash
+df -h /data
+```
+
+showed `/dev/root`.
+
+That is expected for Rancher Local Path Provisioner: the provisioner creates a directory on the node's local/root filesystem and mounts that directory into the Pod. Kubernetes still manages the storage through a PVC/PV, but the backend is not a dedicated GCE block device.
+
+### Why object storage is not a POSIX filesystem
+
+MinIO exposes an S3-compatible **object API**.
+
+Clients interact with:
+
+```text
+bucket
+object key
+PUT
+GET
+HEAD
+DELETE
+HTTP/S3 requests
+```
+
+rather than opening a normal POSIX file and performing arbitrary in-place byte writes.
+
+Object storage has a flat key/object model that can emulate folder prefixes, but those prefixes are not normal filesystem directories. Object operations are API operations rather than POSIX file syscalls.
+
+MinIO itself may use a filesystem/block device internally, but applications should consume it through the object API.
+
+---
+
+## 10.3.2 S3 API, buckets, and presigned URLs
+
+The MacBook Pro did not initially have `mc`.
+
+I installed the pinned ARM64 client:
+
+```text
+RELEASE.2025-08-13T08-35-41Z
+```
+
+and verified the downloaded binary with SHA-256:
+
+```text
+a877fd0c183409da9f20f9d6e1811987298bbbca1aa03428eebdffba79fb9445
+```
+
+Result:
+
+```text
+OK
+```
+
+`mc --version` returned:
+
+```text
+mc version RELEASE.2025-08-13T08-35-41Z
+Runtime: go1.24.6 darwin/arm64
+```
+
+I connected to MinIO through a local port-forward and created the alias:
+
+```text
+shopstack -> http://127.0.0.1:9000
+```
+
+`mc admin info shopstack` reported one online drive and a healthy MinIO instance.
+
+I created the required buckets:
+
+```bash
+mc mb --ignore-existing shopstack/shopstack-images
+mc mb --ignore-existing shopstack/shopstack-backups
+```
+
+`mc ls shopstack` showed:
+
+```text
+shopstack-images/
+shopstack-backups/
+```
+
+### Normal object upload/download
+
+I uploaded:
+
+```text
+shopstack-images/minio-test.txt
+```
+
+listed it with `mc ls`, downloaded it, and compared the original and downloaded copies:
+
+```text
+UPLOAD/DOWNLOAD MATCH
+```
+
+### Presigned download
+
+I generated a short-lived presigned download URL with:
+
+```text
+mc share download --expire 10m
+```
+
+The URL itself was kept in a shell variable and was not printed into the journal.
+
+I downloaded through the presigned URL and compared the content:
+
+```text
+PRESIGNED DOWNLOAD MATCH
+```
+
+### Presigned upload
+
+I generated a short-lived upload form with:
+
+```text
+mc share upload --expire 10m
+```
+
+and uploaded:
+
+```text
+presigned-upload.txt
+```
+
+The uploaded object was downloaded and compared:
+
+```text
+PRESIGNED UPLOAD MATCH
+```
+
+### Why presigned URLs matter
+
+A normal application can authenticate and authorize a user, then generate a short-lived URL for one object operation.
+
+The browser/mobile client can then transfer the object directly to/from S3-compatible storage:
+
+```text
+client
+  -> presigned S3 request
+  -> object storage
+```
+
+instead of:
+
+```text
+client
+  -> application server
+  -> object storage
+```
+
+This reduces application-server bandwidth and memory pressure while keeping the bucket private. The permission is time-limited and operation-specific.
+
+---
+
+## 10.3.3 Application service account and least privilege
+
+I created the policy:
+
+```text
+minio/shopstack-images-rw-policy.json
+```
+
+It permits the application identity to:
+
+```text
+ListBucket / GetBucketLocation on shopstack-images
+GetObject / PutObject / DeleteObject on shopstack-images/*
+```
+
+It does not grant access to:
+
+```text
+shopstack-backups
+```
+
+I created the parent identity:
+
+```text
+shopstack-app-parent
+```
+
+and attached:
+
+```text
+shopstack-images-rw
+```
+
+I then created a dedicated service account.
+
+My first attempt generated a 48-character secret key:
+
+```bash
+openssl rand -hex 24
+```
+
+MinIO rejected it:
+
+```text
+The secret key is invalid.
+(secret key length should be between 8 and 40)
+```
+
+I regenerated the service-account secret as:
+
+```bash
+openssl rand -hex 16
+```
+
+which produced:
+
+```text
+32 characters
+```
+
+The service account was created successfully.
+
+Its runtime credentials were stored in:
+
+```text
+Secret/shopstack/minio-app-credentials
+```
+
+without printing the values.
+
+### Positive proof — images bucket
+
+Using an alias authenticated with the application service account:
+
+```text
+shopstack-app
+```
+
+I listed `shopstack-images`, uploaded `app-policy-test.txt`, downloaded it, and compared the result:
+
+```text
+APP IMAGES READ/WRITE PASS
+```
+
+### Negative proof — backup bucket
+
+Listing the backups bucket returned:
+
+```text
+Access Denied
+```
+
+and:
+
+```text
+EXPECTED DENY: backups list blocked
+```
+
+Attempting to upload to the backups bucket returned insufficient permissions and:
+
+```text
+EXPECTED DENY: backups write blocked
+```
+
+Using the administrative alias I verified that the denied object did not exist:
+
+```text
+CONFIRMED: denied object does not exist
+```
+
+### Mapping to AWS IAM concepts
+
+The MinIO design maps directly onto familiar AWS concepts:
+
+```text
+MinIO service account/access key
+  -> IAM principal/access key
+
+MinIO JSON policy
+  -> IAM policy
+
+s3:GetObject / s3:PutObject / s3:ListBucket
+  -> IAM/S3 actions
+
+arn:aws:s3:::shopstack-images/*
+  -> S3 resource ARN
+
+anything not explicitly allowed
+  -> implicit deny
+```
+
+This makes the policy model transferable to AWS S3 work.
+
+---
+
+## 10.3.4 PostgreSQL backup CronJob -> MinIO + restore
+
+The existing Task 6 backup CronJob originally contained one container:
+
+```text
+pg-dump
+```
+
+and wrote nightly backups to:
+
+```text
+PVC/shopstack/postgres-backups
+```
+
+I preserved the existing PVC copy and extended the CronJob so the same dump is also uploaded to MinIO.
+
+### Backup-only MinIO identity
+
+I created:
+
+```text
+minio/shopstack-backups-rw-policy.json
+```
+
+The policy permits:
+
+```text
+ListBucket / GetBucketLocation on shopstack-backups
+GetObject / PutObject on shopstack-backups/*
+```
+
+It intentionally does not grant object deletion.
+
+I created:
+
+```text
+shopstack-backup-parent
+```
+
+and a dedicated backup service account.
+
+The runtime credentials were stored in:
+
+```text
+Secret/shopstack/minio-backup-credentials
+```
+
+### Updated CronJob
+
+The tracked file remained:
+
+```text
+data/postgres-backup-cronjob.yaml
+```
+
+The updated Job template contains:
+
+```text
+pg-dump
+minio-upload
+```
+
+`pg-dump` writes a custom-format PostgreSQL dump to the existing `/backups` PVC.
+
+The uploader waits for a Pod-specific completion marker and then uploads the same file to:
+
+```text
+http://minio.storage.svc.cluster.local:9000
+shopstack-backups/
+```
+
+### First object-backup Job failure
+
+The first manual test Job failed.
+
+`pg-dump` succeeded:
+
+```text
+Creating backup: /backups/boutique-20260920T091237Z.dump
+Backup completed:
+3.9K
+```
+
+but the uploader returned:
+
+```text
+/bin/sh: line 3: hostname: command not found
+```
+
+Cause:
+
+```text
+quay.io/minio/mc
+```
+
+is intentionally small and did not contain the `hostname` utility used by my first marker implementation.
+
+I fixed this by using the Kubernetes Downward API in both containers:
+
+```yaml
+- name: POD_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.name
+```
+
+and changed the marker to:
+
+```text
+/backups/.${POD_NAME}.ready
+```
+
+This removed the dependency on a utility that was not present in the image.
+
+### Successful object backup
+
+I applied the corrected CronJob and manually triggered:
+
+```text
+postgres-backup-object-test-172238
+```
+
+The Job completed successfully.
+
+`pg-dump` created:
+
+```text
+boutique-20260920T092242Z.dump
+```
+
+and the uploader logged:
+
+```text
+Uploading boutique-20260920T092242Z.dump to shopstack-backups
+Object backup completed
+```
+
+`mc ls shopstack/shopstack-backups` showed:
+
+```text
+boutique-20260920T092242Z.dump
+3.9 KiB
+```
+
+### Real restore from the object copy
+
+I downloaded the actual object from MinIO:
+
+```text
+shopstack/shopstack-backups/boutique-20260920T092242Z.dump
+```
+
+The local SHA-256 was:
+
+```text
+1f431c7c7e6997c34c17e36490108bfe3b189aace0049d2c5196f5e769360f80
+```
+
+I copied it into `postgres-0`, created a temporary database:
+
+```text
+boutique_object_restore
+```
+
+and restored with `pg_restore`.
+
+Comparison:
+
+```text
+original_rows=5
+restored_rows=5
+OBJECT RESTORE VERIFIED
+```
+
+I then removed the temporary restore database and files.
+
+The production database remained:
+
+```text
+5
+```
+
+rows.
+
+This demonstrated a real recovery path from the object-storage copy, not merely the existence of a backup file.
+
+### Reuse by other data stores
+
+The same S3-compatible backup system can also be used as:
+
+```text
+NebulaGraph BR object-storage target
+Elasticsearch S3 snapshot repository
+```
+
+The Task 6 runbooks already documented those future integrations against the Task 7 MinIO object-storage design.
+
+---
+
+## 10.3.5 Versioning and lifecycle
+
+Before this step, the long-running local MinIO port-forward exited with:
+
+```text
+error: lost connection to pod
+```
+
+I verified:
+
+```text
+all Kubernetes nodes Ready
+MinIO Pod 1/1 Running
+MinIO Service present
+```
+
+so the failure was only the local port-forward stream.
+
+I restarted the port-forward and confirmed:
+
+```text
+MinIO API OK
+```
+
+before continuing.
+
+### Enable versioning
+
+I enabled versioning on:
+
+```text
+shopstack-backups
+```
+
+Verification:
+
+```text
+shopstack/shopstack-backups versioning is enabled
+```
+
+### Create and overwrite an object
+
+I uploaded:
+
+```text
+Task 7 backup version ONE
+```
+
+as:
+
+```text
+task7-versioning-proof.txt
+```
+
+Then I overwrote the same key with:
+
+```text
+Task 7 backup version TWO
+```
+
+The current object returned:
+
+```text
+Task 7 backup version TWO
+```
+
+Version listing showed:
+
+```text
+v2  d57d7311-f604-4ecf-bdce-6cfffb1f37cd
+v1  fdf22ff9-4674-422b-b956-ec93c11fe74d
+```
+
+### Restore the previous version
+
+I downloaded the old v1 explicitly by version ID:
+
+```text
+fdf22ff9-4674-422b-b956-ec93c11fe74d
+```
+
+The retrieved content was:
+
+```text
+Task 7 backup version ONE
+```
+
+Verification:
+
+```text
+PREVIOUS VERSION RETRIEVED
+```
+
+I uploaded that old content to the same object key again.
+
+The new current object became:
+
+```text
+Task 7 backup version ONE
+```
+
+and verification returned:
+
+```text
+PREVIOUS VERSION RESTORED AS CURRENT
+```
+
+The final version history contained:
+
+```text
+v3  ONE  2c5949c2-7ed0-42fe-9e17-baf975d6aa85
+v2  TWO  d57d7311-f604-4ecf-bdce-6cfffb1f37cd
+v1  ONE  fdf22ff9-4674-422b-b956-ec93c11fe74d
+```
+
+### Lifecycle policy
+
+I added:
+
+```text
+NoncurrentVersionExpiration = 7 days
+```
+
+The lifecycle rule was enabled.
+
+### Why versioning matters for backup integrity
+
+Versioning protects against accidental overwrite and many cases of accidental or unauthorized replacement because the previous object remains recoverable.
+
+It also improves ransomware recovery options when an attacker or compromised application overwrites current objects.
+
+However, versioning is not a complete anti-ransomware control by itself. If an attacker has credentials that can delete versions or modify lifecycle rules, historical versions can still be destroyed.
+
+A stronger design combines:
+
+```text
+versioning
+least-privilege backup identity
+no routine delete permission
+retention/lifecycle controls
+independent credentials
+restore testing
+checksums
+and, where available, immutable/object-lock retention
+```
+
+The successful PostgreSQL restore drill was therefore as important as enabling versioning.
+
+---
+
+## 10.3.6 MinIO Console through Istio
+
+I reused the existing Task 5 Istio Gateway rather than creating a second ingress stack.
+
+Existing hosts were:
+
+```text
+shopstack.local
+kibana.shopstack.local
+studio.shopstack.local
+```
+
+I extended:
+
+```text
+istio/gateway.yaml
+```
+
+with:
+
+```text
+minio.shopstack.local
+```
+
+and created:
+
+```text
+istio/minio-virtualservice.yaml
+```
+
+The destination was:
+
+```text
+minio.storage.svc.cluster.local:9001
+```
+
+### Gateway YAML validation error
+
+My first automated edit inserted the new host with incorrect YAML indentation.
+
+Client-side dry-run rejected the file:
+
+```text
+error converting YAML to JSON:
+yaml: line 17: did not find expected key
+```
+
+The live Gateway had not yet been modified.
+
+I inspected the whitespace and corrected:
+
+```yaml
+hosts:
+  - shopstack.local
+  - kibana.shopstack.local
+  - studio.shopstack.local
+  - minio.shopstack.local
+```
+
+The second dry-run succeeded and I applied both resources.
+
+Live verification showed:
+
+```text
+shopstack-gateway
+  shopstack.local
+  kibana.shopstack.local
+  studio.shopstack.local
+  minio.shopstack.local
+```
+
+and:
+
+```text
+VirtualService/minio
+host:        minio.shopstack.local
+destination: minio.storage.svc.cluster.local
+port:        9001
+```
+
+### Route verification
+
+The kubeadm Istio ingress Service was a `LoadBalancer`, but because this self-managed cluster did not have cloud LoadBalancer integration, its external IP remained:
+
+```text
+<pending>
+```
+
+I forwarded local port 8080 to the Istio ingress gateway and tested the Gateway host route:
+
+```bash
+curl -sS \
+  -o /dev/null \
+  -w 'HTTP %{http_code}\n' \
+  -H 'Host: minio.shopstack.local' \
+  http://127.0.0.1:8080/
+```
+
+Result:
+
+```text
+HTTP 200
+```
+
+I added:
+
+```text
+127.0.0.1 minio.shopstack.local
+```
+
+to the MacBook Pro `/etc/hosts`.
+
+A background ingress port-forward later exited before the browser test, so I restarted the same port-forward in a foreground Terminal and kept it open while using the browser.
+
+The browser then successfully reached:
+
+```text
+http://minio.shopstack.local:8080
+```
+
+through:
+
+```text
+browser
+ -> localhost:8080
+ -> istio-ingressgateway:80
+ -> shopstack-gateway
+ -> VirtualService/minio
+ -> minio.storage.svc.cluster.local:9001
+```
+
+I logged in and opened:
+
+```text
+Object Browser
+ -> shopstack-backups
+```
+
+The bucket browser showed:
+
+```text
+boutique-20260920T092242Z.dump
+task7-versioning-proof.txt
+```
+
+The required screenshot was stored as:
+
+```text
+docs/evidence/task7/minio-console-bucket-browser.png
+```
+
+![MinIO bucket browser](docs/evidence/task7/minio-console-bucket-browser.png)
+
+---
+
+# Checkpoint Questions
+
+## 1. What is the relationship between PV, PVC, and StorageClass?
+
+A **PersistentVolume (PV)** represents storage capacity available to Kubernetes.
+
+A **PersistentVolumeClaim (PVC)** is an application's request for storage, including capacity and access mode.
+
+A **StorageClass** describes how storage should be provisioned, including the provisioner/CSI driver, reclaim behavior, binding mode, and other backend-specific parameters.
+
+With dynamic provisioning the relationship is:
+
+```text
+Pod / StatefulSet
+  -> PVC
+  -> StorageClass
+  -> provisioner / CSI driver
+  -> PV
+  -> backend storage
+```
+
+In this lab:
+
+```text
+postgres-data-postgres-0
+  -> local-path
+  -> rancher.io/local-path
+  -> pvc-8ce1363e-...
+```
+
+The PVC is what the workload references; the PV is the storage resource that satisfies the claim.
+
+---
+
+## 2. What does `volumeBindingMode: WaitForFirstConsumer` do, and why does it matter for multi-zone clusters?
+
+`WaitForFirstConsumer` delays volume provisioning/binding until a Pod that consumes the PVC is being scheduled.
+
+This allows Kubernetes to consider the Pod's scheduling constraints and storage topology together.
+
+Without this delay, a dynamically provisioned volume could be created in one zone before Kubernetes knows where the Pod can run. The Pod might then be schedulable only in another zone, creating a topology conflict.
+
+With `WaitForFirstConsumer`:
+
+```text
+Pod scheduling requirements
++ node/zone topology
++ storage topology
+```
+
+can be evaluated before the storage is committed.
+
+In this lab, `local-path` uses the same idea to create node-local storage only after a consumer provides a scheduling context.
+
+---
+
+## 3. Why is NFS usually a poor choice for database data files, while block storage is a good one?
+
+A database such as PostgreSQL expects filesystem behavior with predictable durability and latency for operations such as:
+
+```text
+fsync
+random reads/writes
+file locking
+rename
+WAL writes
+metadata operations
+```
+
+Block storage gives the database a filesystem with direct single-host semantics and normally provides more predictable latency and failure behavior.
+
+NFS adds a networked filesystem layer, network latency, server availability dependencies, caching/locking considerations, and more complex failure semantics.
+
+Modern enterprise NFS systems can support databases when explicitly designed and validated for that workload, but block storage is normally the simpler and more predictable default for PostgreSQL data files.
+
+---
+
+## 4. Block vs file vs object storage — one ShopStack workload for each
+
+### Block storage
+
+Best fit:
+
+```text
+PostgreSQL data directory
+```
+
+Why:
+
+The database needs a mounted filesystem, durable random read/write operations, `fsync`, WAL, and low-latency single-writer semantics.
+
+### File storage
+
+Natural fit:
+
+```text
+a shared POSIX workspace for generated ShopStack reports,
+imports, or shared application files that multiple replicas
+must mount concurrently
+```
+
+Why:
+
+Multiple Pods can use normal filesystem operations against the same shared hierarchy.
+
+This Final Run did not deploy an NFS backend, but this is the storage model that would fit that type of shared-file workload.
+
+### Object storage
+
+Best fit:
+
+```text
+product images
+database backup dumps
+Elasticsearch snapshots
+NebulaGraph backup objects
+```
+
+Why:
+
+These are naturally stored and retrieved as whole objects through an S3 API, do not require POSIX in-place editing, and benefit from bucket policies, presigned URLs, versioning, and lifecycle controls.
+
+---
+
+## 5. Why can PostgreSQL's data directory not run on MinIO even though both are "storage"?
+
+PostgreSQL does not simply need a place that can hold bytes. It needs POSIX filesystem semantics.
+
+The database continuously performs operations such as:
+
+```text
+open/read/write
+random in-place updates
+fsync
+rename
+directory operations
+WAL updates
+file locking
+```
+
+MinIO exposes objects through an S3-compatible HTTP API.
+
+An S3 object is addressed by bucket/key and is normally replaced as an object operation rather than mutated like an ordinary local file.
+
+Therefore:
+
+```text
+PostgreSQL data directory -> mounted filesystem/block storage
+PostgreSQL backup dump    -> object storage is an excellent fit
+```
+
+That is why the live PGDATA remained on a PVC while `pg_dump` artifacts were sent to MinIO.
+
+---
+
+## 6. What does S3 compatibility buy operationally?
+
+S3 compatibility gives applications and operators a common object-storage API model:
+
+```text
+buckets
+object keys
+GET / PUT / DELETE
+access keys
+signed requests
+presigned URLs
+IAM-style policies
+versioning
+lifecycle
+```
+
+Tools and application designs built around these concepts can move between S3-compatible providers with comparatively small changes.
+
+For example, the PostgreSQL backup design still consists of:
+
+```text
+create pg_dump
+authenticate to object storage
+upload object to backup bucket
+download object during restore
+```
+
+Moving between AWS S3 and MinIO mainly changes the endpoint, credentials, and provider-specific configuration rather than the core backup workflow.
+
+The same compatibility is also why Elasticsearch S3 snapshot tooling and NebulaGraph backup workflows can target an S3-compatible MinIO service.
+
+---
+
+# Final Task 7 Repository Artifacts
+
+## Linux / Kubernetes storage evidence
+
+```text
+storage/rwo-second-node-test.yaml
+```
+
+Existing PostgreSQL storage manifests reused and verified:
+
+```text
+data/postgres-statefulset.yaml
+data/postgres-headless-service.yaml
+```
+
+The storage write-up and persistence proof are documented in this Task 7 journal, including:
+
+```text
+GCP Persistent Disk hot-add
+XFS /data mount
+UUID-based /etc/fstab
+LVM online growth
+StorageClass / CSI notes
+PVC/PV evidence
+Pod deletion persistence proof
+StatefulSet deletion persistence proof
+RWO second-node failure
+```
+
+## MinIO
+
+```text
+minio/namespace.yaml
+minio/pvc.yaml
+minio/deployment.yaml
+minio/service.yaml
+minio/shopstack-images-rw-policy.json
+minio/shopstack-backups-rw-policy.json
+```
+
+Updated PostgreSQL backup integration:
+
+```text
+data/postgres-backup-cronjob.yaml
+```
+
+Istio exposure:
+
+```text
+istio/gateway.yaml
+istio/minio-virtualservice.yaml
+```
+
+Screenshot evidence:
+
+```text
+docs/evidence/task7/minio-console-bucket-browser.png
+```
+
+Runtime Secrets created during the Final Run:
+
+```text
+storage/minio-root-credentials
+shopstack/minio-app-credentials
+shopstack/minio-backup-credentials
+```
+
+The secret values are intentionally not stored in Git. The journal records the creation method without exposing the credentials.
+
+---
+
+# Troubleshooting Notes
+
+## `k8s-worker-2` was unhealthy before Task 7 practical work
+
+**Symptom**
+
+Serial output repeatedly reported:
+
+```text
+Failed to start systemd-journald.service
+```
+
+The node stopped behaving normally.
+
+**Investigation**
+
+I checked serial output for:
+
+```text
+OOM killer
+out of memory
+no space left
+I/O error
+read-only filesystem
+```
+
+No current OOM or full-disk evidence was found.
+
+**Resolution**
+
+Performed a GCE instance reset, restored the correct `KUBECONFIG`, waited for the node to become Ready, then verified PostgreSQL row count `5`.
+
+I did not reset kubeadm, certificates, or the cluster.
+
+---
+
+## Elasticsearch CR name assumption was wrong
+
+**Symptom**
+
+```text
+Elasticsearch "shopstack-es" not found
+```
+
+**Cause**
+
+The generated StatefulSet was named `shopstack-es-default`, but the ECK custom resource itself was named:
+
+```text
+shopstack
+```
+
+**Resolution**
+
+Used:
+
+```bash
+kubectl get elasticsearch -A
+```
+
+and the tracked manifest to identify the real CR name before making any resource decision.
+
+---
+
+## Kubernetes API tunnel expired during Task 7
+
+**Symptom**
+
+```text
+The connection to the server 127.0.0.1:6443 was refused
+```
+
+**Cause**
+
+The private kubeadm API is intentionally accessed through an SSH tunnel, and the previous forwarding process had ended.
+
+**Resolution**
+
+Recreated only the SSH forward to `10.10.0.10:6443`. No cluster resource was reset.
+
+---
+
+## `mc admin policy entities` opened help/pager
+
+**Symptom**
+
+The command displayed `mc` help in the internal pager.
+
+**Cause**
+
+The policy name was passed as a positional argument instead of with:
+
+```text
+--policy
+```
+
+**Resolution**
+
+Exited the pager and used:
+
+```bash
+mc admin policy entities \
+  shopstack \
+  --policy shopstack-images-rw \
+  --disable-pager
+```
+
+The expected parent-user mapping was returned.
+
+---
+
+## MinIO service-account secret was too long
+
+**Symptom**
+
+```text
+secret key length should be between 8 and 40
+```
+
+**Cause**
+
+`openssl rand -hex 24` produced a 48-character hex string.
+
+**Resolution**
+
+Used:
+
+```bash
+openssl rand -hex 16
+```
+
+which produced a 32-character secret. The service account was then created successfully.
+
+---
+
+## Backup uploader image did not contain `hostname`
+
+**Symptom**
+
+The first object-backup Job failed with:
+
+```text
+/bin/sh: line 3: hostname: command not found
+```
+
+while `pg_dump` itself had succeeded.
+
+**Cause**
+
+The minimal `quay.io/minio/mc` image did not include the `hostname` utility used by the marker script.
+
+**Resolution**
+
+Used Kubernetes Downward API `metadata.name` as `POD_NAME` and changed the marker to:
+
+```text
+/backups/.${POD_NAME}.ready
+```
+
+The next Job completed and uploaded the real dump to MinIO.
+
+---
+
+## MinIO local port-forward lost its Pod stream
+
+**Symptom**
+
+The background port-forward exited and `mc` returned connection refused.
+
+The log showed:
+
+```text
+error: lost connection to pod
+```
+
+**Investigation**
+
+All three nodes were Ready and the MinIO Pod remained:
+
+```text
+1/1 Running
+```
+
+**Resolution**
+
+Restarted only the local port-forward. MinIO data and bucket configuration were unchanged.
+
+---
+
+## Istio Gateway YAML indentation error
+
+**Symptom**
+
+Client-side dry-run rejected `istio/gateway.yaml`:
+
+```text
+yaml: line 17: did not find expected key
+```
+
+**Cause**
+
+An automated edit inserted `minio.shopstack.local` two spaces too far left.
+
+**Resolution**
+
+Inspected the file with line numbers and visible whitespace, corrected the indentation, and reran dry-run before applying.
+
+This prevented malformed YAML from reaching the live Gateway.
+
+---
+
+## Background Istio port-forward exited before browser evidence
+
+**Symptom**
+
+The host-header `curl` through the Istio Gateway had already returned:
+
+```text
+HTTP 200
+```
+
+but the browser later showed `ERR_CONNECTION_REFUSED`.
+
+**Cause**
+
+The background local port-forward on TCP/8080 had exited.
+
+**Resolution**
+
+Ran the same ingress port-forward in a dedicated foreground Terminal while using the browser.
+
+The MinIO Console then loaded successfully through:
+
+```text
+minio.shopstack.local:8080
+```
+
+and the required bucket-browser screenshot was captured.
+
+---
+
+# Task 7 Summary
+
+Task 7 Final Run completed the full storage path:
+
+```text
+Linux block storage
+  GCP Persistent Disk hot-add
+  lsblk / fdisk identification
+  GPT partition
+  XFS
+  /data
+  UUID-based /etc/fstab
+  real unmount + mount -a verification
+  LVM PV/VG/LV
+  online LV growth
+  online XFS growth
+  data preserved
+
+Kubernetes persistence
+  local-path StorageClass inspection
+  dynamic provisioning explanation
+  GCE PD CSI research
+  PostgreSQL 5Gi RWO volumeClaimTemplate
+  real PGDATA files on the PVC
+  Pod deletion persistence proof
+  whole-StatefulSet deletion persistence proof
+  stable PVC/PV reuse
+  RWO second-node topology failure
+  RWO/RWX and block/file/object comparison
+
+MinIO object storage
+  storage namespace
+  Secret-based root credentials
+  PVC-backed single-node MinIO
+  shopstack-images
+  shopstack-backups
+  mc client
+  normal upload/download
+  presigned download/upload
+  images-only application service account
+  backup access denied for app identity
+  dedicated backup identity
+  PostgreSQL CronJob upload to S3-compatible storage
+  real object backup restore: 5 rows -> 5 rows
+  bucket versioning
+  previous-version recovery
+  7-day non-current lifecycle
+  MinIO Console through Istio
+  bucket-browser screenshot
+```
+
+The required journal conclusion is:
+
+> **block storage = one filesystem, one consumer at a time; this is exactly what a database wants.**
+
+For Kubernetes access-mode terminology, `ReadWriteOnce` specifically means one node at a time; the local-path topology in this lab also tied the volume to one node.
+
+No Task 7 practical infrastructure requirement remains outstanding.
+
+---
+
+**Task 7 status: COMPLETE**
 ---

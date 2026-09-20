@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rwo-second-node-test
+  namespace: data
+  annotations:
+    sidecar.istio.io/inject: "false"
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: k8s-worker-1
+  containers:
+    - name: consumer
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: postgres-data
+          mountPath: /mnt/postgres
+  volumes:
+    - name: postgres-data
+      persistentVolumeClaim:
+        claimName: postgres-data-postgres-0

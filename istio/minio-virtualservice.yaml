@@ -1,0 +1,16 @@
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: minio
+  namespace: shopstack
+spec:
+  hosts:
+    - minio.shopstack.local
+  gateways:
+    - shopstack-gateway
+  http:
+    - route:
+        - destination:
+            host: minio.storage.svc.cluster.local
+            port:
+              number: 9001
