@@ -1809,7 +1809,7 @@ No Proxmox VE hardware was available. The documented Task 2 fallback permits thr
 
 The MacBook Pro was initially evaluated for the local VirtualBox fallback. It had approximately 8 GB RAM and approximately 25 GiB free storage. Because the Kubernetes environment requires three VMs with 4 GB RAM each, running the full environment locally would heavily overcommit the MacBook and risk resource pressure.
 
-Google Compute Engine was therefore selected for the Final Run.
+Google Compute Engine was therefore selected for the lab environment.
 
 Provider-specific VPC, subnet, firewall, and initial source-VM settings were configured in the GCP Console. The reusable Machine Image, VM clones, snapshots, resource verification, and static-IP reservation were then performed with `gcloud` in Google Cloud Shell.
 
@@ -2093,7 +2093,7 @@ Although VirtualBox itself worked on the Apple M2 host, the MacBook Pro did not 
 
 The task documentation explicitly allows a cloud-VM fallback when Proxmox hardware is unavailable.
 
-I therefore selected Google Compute Engine for the Final Run.
+I therefore selected Google Compute Engine for the lab environment.
 
 The final GCP design used:
 
@@ -4423,7 +4423,7 @@ This makes build provenance and rollback targets explicit.
 
 ## 7.5.8 Rootless Podman with a systemd User Unit on a VM
 
-The original task names a Proxmox VM. The Final Run uses the documented GCP cloud-VM substitution from Tasks 2–3, so I used the existing Ubuntu 24.04 AMD64 worker `k8s-worker-2`. This preserves the learning objective: run the registry image rootlessly on a normal Linux host outside Kubernetes and manage it with a systemd user service.
+The original task names a Proxmox VM. This lab uses the documented GCP cloud-VM substitution from Tasks 2–3, so I used the existing Ubuntu 24.04 AMD64 worker `k8s-worker-2`. This preserves the learning objective: run the registry image rootlessly on a normal Linux host outside Kubernetes and manage it with a systemd user service.
 
 I installed Podman from Ubuntu packages on `k8s-worker-2` and verified:
 
@@ -6747,7 +6747,7 @@ docs/evidence/task5/
 └── jaeger-distributed-trace.png
 ```
 
-These screenshots document the Kiali service graph and mTLS state, Grafana request/error rates, and Jaeger distributed trace captured during the Final Run.
+These screenshots document the Kiali service graph and mTLS state, Grafana request/error rates, and Jaeger distributed trace captured during the Task 5 implementation.
 
 ---
 
@@ -6954,7 +6954,7 @@ istio/
 └── virtualservice.yaml
 ```
 
-Additional Task 5 implementation/evidence manifests created during the Final Run:
+Additional Task 5 implementation/evidence manifests created during the exercise:
 
 ```text
 istio/
@@ -7194,7 +7194,7 @@ to retrieve the loadgenerator logs successfully.
 
 # Task 6 — Data Stores: PostgreSQL, Redis, Elasticsearch, NebulaGraph
 
-**Final Run period:** 2026-09-15 to 2026-09-19<br>
+**Implementation period:** 2026-09-15 to 2026-09-19<br>
 **Date completed:** 2026-09-19<br>
 **Working machine:** MacBook Pro<br>
 **Primary Kubernetes environment:** Three-node kubeadm cluster on Google Compute Engine<br>
@@ -7208,7 +7208,7 @@ to retrieve the loadgenerator logs successfully.
 **Nebula Operator namespace:** `nebula-system`<br>
 **Kubeconfig:** `~/.kube/task4-final-config`<br>
 
-The Final Run reused the kubeadm cluster from Tasks 3–5:
+The Task 6 implementation reused the kubeadm cluster from Tasks 3–5:
 
 ```text
 k8s-cp        10.10.0.10   control-plane   v1.37.0
@@ -7304,7 +7304,7 @@ keys:
   db-user
 ```
 
-The existing values were verified to match the intended Final Run lab credentials.
+The existing values were verified to match the intended lab credentials.
 
 Kubernetes Secrets are namespace-scoped, so a Pod in `data` cannot directly reference a Secret stored in `shopstack`. I copied the same encoded Secret data into an equivalent runtime Secret:
 
@@ -9190,7 +9190,7 @@ elastic/resource-discipline.md
 
 ### Elasticsearch heap rule
 
-The Final Run uses:
+The Elasticsearch deployment uses:
 
 ```text
 -Xms2g -Xmx2g
@@ -10281,7 +10281,7 @@ For a Redis-based job queue, I would prefer AOF because recent accepted jobs are
 
 `yellow` means all primary shards are allocated, but one or more replicas are not.
 
-The Final Run `products` index had:
+The `products` index had:
 
 ```text
 1 primary
@@ -10332,7 +10332,7 @@ storaged:
   persistent
 ```
 
-In the Final Run, metad and storaged received PVCs; graphd did not receive a main graph-data PVC.
+In this implementation, metad and storaged received PVCs; graphd did not receive a main graph-data PVC.
 
 ---
 
@@ -10459,7 +10459,7 @@ were all present in the tracked desired-state files.
 
 # Task 6 Summary
 
-Task 6 Final Run completed all four data-store areas:
+Task 6 completed all four data-store areas:
 
 ```text
 PostgreSQL
@@ -10533,7 +10533,7 @@ The task also produced real troubleshooting evidence around private API tunnels,
 
 The Task 3–6 kubeadm cluster was reused directly.
 
-Because the Final Run uses Google Compute Engine rather than Proxmox, the Task 10.1 hypervisor-side block-storage exercise was implemented with **GCP Persistent Disk hot-attach**. This is the same block-storage concept from the guest Linux point of view, but I documented the provider substitution explicitly rather than claiming that Proxmox was used.
+Because this lab uses Google Compute Engine rather than Proxmox, the Task 10.1 hypervisor-side block-storage exercise was implemented with **GCP Persistent Disk hot-attach**. This is the same block-storage concept from the guest Linux point of view, but I documented the provider substitution explicitly rather than claiming that Proxmox was used.
 
 The Kubernetes API remained private. Local `kubectl` access continued to use:
 
@@ -12255,7 +12255,7 @@ Why:
 
 Multiple Pods can use normal filesystem operations against the same shared hierarchy.
 
-This Final Run did not deploy an NFS backend, but this is the storage model that would fit that type of shared-file workload.
+This lab did not deploy an NFS backend, but this is the storage model that would fit that type of shared-file workload.
 
 ### Object storage
 
@@ -12397,7 +12397,7 @@ Screenshot evidence:
 docs/evidence/task7/minio-console-bucket-browser.png
 ```
 
-Runtime Secrets created during the Final Run:
+Runtime Secrets created during the lab:
 
 ```text
 storage/minio-root-credentials
@@ -12652,7 +12652,7 @@ and the required bucket-browser screenshot was captured.
 
 # Task 7 Summary
 
-Task 7 Final Run completed the full storage path:
+Task 7 completed the full storage path:
 
 ```text
 Linux block storage
