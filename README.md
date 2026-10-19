@@ -377,7 +377,7 @@ Restore success depends on valid runtime credentials, accessible MinIO, compatib
 
 - [GitHub Actions workflow and run history](https://github.com/culerty516/shopstack-devops-lab/actions/workflows/build-image.yaml)
 - [Workflow configuration](.github/workflows/build-image.yaml) including `linux/amd64,linux/arm64` build, vulnerability scan, and conditional deployment.
-- **Open item:** A dedicated screenshot of the green multi-arch CI run has not been identified in the tracked `docs/evidence/` directory. Capture or attach it before claiming the exact Capstone screenshot deliverable is complete.
+- [Green Multi-Arch CI Screenshot](docs/evidence/task4/github-actions-multiarch-success.png) — [Successful Workflow #11](https://github.com/culerty516/shopstack-devops-lab/actions/runs/35516140322), demonstrating successful AMD64/ARM64 build, Trivy vulnerability gate, and Kubernetes deployment.
 
 ### Other evidence
 
