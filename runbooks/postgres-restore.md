@@ -4,7 +4,7 @@
 
 This runbook restores the ShopStack `boutique` PostgreSQL database from a logical `pg_dump` backup.
 
-Environment used in the Task 6 Final Run:
+Environment used for the Task 6 restore exercise:
 
 - Namespace: `data`
 - PostgreSQL StatefulSet: `postgres`
@@ -102,7 +102,7 @@ kubectl exec \
   '
 ~~~
 
-For the Task 6 Final Run, the `products` table contained 5 rows before the drill.
+During the Task 6 restore drill, the `products` table contained 5 rows before the destructive step.
 
 Delete the table:
 

@@ -51,4 +51,4 @@ PBS provides features including:
 - retention management;
 - efficient restore.
 
-Because this Final Run used the permitted GCP fallback, actual GCP disk snapshots were created and the equivalent Proxmox backup design was documented rather than claiming that a Proxmox environment was available.
+Because this implementation used the permitted GCP fallback, actual GCP disk snapshots were created and the equivalent Proxmox backup design was documented rather than claiming that a Proxmox environment was available.

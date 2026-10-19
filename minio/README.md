@@ -1,6 +1,6 @@
 # Task 7 MinIO Evidence
 
-This directory contains the declarative MinIO resources and policy artifacts used in the Task 7 Final Run.
+This directory contains the declarative MinIO resources and policy artifacts used for Task 7.
 
 ## Deployment
 
@@ -130,7 +130,7 @@ pg-dump
 minio-upload
 ```
 
-The successful Final Run object backup was:
+The successfully uploaded PostgreSQL backup object was:
 
 ```text
 shopstack-backups/boutique-20260920T092242Z.dump

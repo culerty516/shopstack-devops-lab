@@ -6,7 +6,7 @@ Redis Sentinel provides high availability for a primary-replica Redis deployment
 
 Sentinel monitors the Redis primary and replicas, detects failures, coordinates failover, promotes a replica to become the new primary, and informs clients about the current primary.
 
-In the ShopStack Task 6 Final Run, three Redis Sentinel instances were deployed with a quorum of two.
+In the ShopStack Task 6 exercise, three Redis Sentinel instances were deployed with a quorum of two.
 
 The initial topology was:
 
@@ -52,7 +52,7 @@ Redis Sentinel was selected for the Task 6 high-availability exercise because th
 
 The three-Sentinel setup used a quorum of two so that a single Sentinel could not independently declare the primary objectively down and authorize a failover.
 
-The Final Run demonstrated that:
+The failover drill demonstrated that:
 
 - all three Sentinels discovered each other;
 - quorum and failover authorization were available;

@@ -2,7 +2,7 @@
 
 ## Fallback Implementation
 
-The Task 2 instructions permit cloud VMs when Proxmox hardware is unavailable. The Final Run therefore used Google Compute Engine.
+The Task 2 instructions permit cloud VMs when Proxmox hardware is unavailable. This implementation therefore used Google Compute Engine.
 
 The Proxmox concepts were mapped as follows:
 
@@ -31,7 +31,7 @@ The reusable source VM was:
 - Subnet: `shopstack-subnet`
 - Network tag: `shopstack-k8s`
 
-A 40 GB disk was used because the earlier trial exposed insufficient root-disk capacity.
+A 40 GB disk was selected to avoid insufficient root-disk capacity for Kubernetes and container workloads.
 
 Verification showed:
 

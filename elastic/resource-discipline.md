@@ -32,7 +32,7 @@ After Metrics Server became healthy:
 | Elasticsearch `shopstack-es-default-0` | approximately 41-43m | 2696Mi |
 | Kibana `shopstack-kb` | approximately 28m | 908Mi |
 
-Worker 2 was using approximately 85% of its available memory, confirming that the Final Run cluster is resource constrained.
+Worker 2 was using approximately 85% of its available memory, confirming that the lab cluster is resource constrained.
 
 ## Elasticsearch JVM heap
 

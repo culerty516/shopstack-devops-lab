@@ -2,7 +2,7 @@
 
 ## Environment
 
-Task 2 Final Run uses the documented cloud-VM fallback because Proxmox hardware was not available.
+Task 2 uses the documented cloud-VM fallback because Proxmox hardware was not available.
 
 - Provider: Google Cloud Platform
 - Region: us-central1

@@ -2,7 +2,7 @@
 
 ## ShopStack example
 
-The Task 6 Final Run demonstrated the cache-aside pattern using product `SKU-002`.
+The Task 6 exercise demonstrated the cache-aside pattern using product `SKU-002`.
 
 The flow was:
 
@@ -26,7 +26,7 @@ if cache miss:
     return database result
 ~~~
 
-During the Final Run, the first Redis lookup was a cache miss.
+During the cache-aside demonstration, the first Redis lookup was a cache miss.
 
 PostgreSQL returned:
 
